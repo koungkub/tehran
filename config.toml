@@ -1,0 +1,22 @@
+# Example configuration for tehran.
+# Precedence: hardcoded defaults < this file < TEHRAN_* env vars < CLI flags.
+
+[server]
+host = "0.0.0.0"
+port = 8080
+shutdown_timeout = "10s"
+
+[ops]
+host = "0.0.0.0"
+port = 9090
+
+[otel]
+enabled = true
+endpoint = "localhost:4317" # OTLP gRPC collector endpoint
+insecure = true
+sample_ratio = 1.0
+service_name = "tehran"
+
+[log]
+level = "info"
+format = "console" # "json" in production

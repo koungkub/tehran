@@ -1,0 +1,44 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - depguard
+    - errorlint
+    - gosec
+    - misspell
+    - revive
+    - unconvert
+    - unparam
+  settings:
+    depguard:
+      rules:
+        # Platform packages are shared infrastructure; they must never depend on
+        # a business/domain module (dependencies point domain -> platform, never
+        # the reverse). Add each new domain module package to this deny list.
+        platform-no-domains:
+          files:
+            - "**/internal/platform/**"
+          deny:
+            - pkg: github.com/koungkub/tehran/internal/greeter
+              desc: platform packages must not import domain modules
+        # Domain modules are isolated bounded contexts: they talk to each other
+        # only through interfaces wired at the composition root (internal/app),
+        # never by importing a sibling directly. When a second module is added,
+        # give each module a rule here denying the others.
+        greeter-no-siblings:
+          files:
+            - "**/internal/greeter/**"
+          deny: []
+  exclusions:
+    paths:
+      - gen
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+  exclusions:
+    paths:
+      - gen
