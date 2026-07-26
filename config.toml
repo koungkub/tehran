@@ -5,10 +5,20 @@
 host = "0.0.0.0"
 port = 8080
 shutdown_timeout = "10s"
+max_request_bytes = 4194304  # 4 MiB cap on a decompressed request message
+read_header_timeout = "10s"  # no read timeout: it would abort streaming RPCs
 
 [ops]
 host = "0.0.0.0"
 port = 9090
+shutdown_timeout = "5s" # short: nothing served here is long-running
+read_header_timeout = "10s"
+
+[lifecycle]
+# Backstop over the whole ordered shutdown; should exceed the sum of the
+# components' own drain timeouts, since it exists to catch a component that
+# ignores its context rather than to cut drains short.
+shutdown_timeout = "30s"
 
 [otel]
 enabled = true
@@ -18,5 +28,5 @@ sample_ratio = 1.0
 service_name = "tehran"
 
 [log]
-level = "info"
+level = "info"     # zerolog level: trace, debug, info, warn, error, fatal, panic
 format = "console" # "json" in production

@@ -2,13 +2,12 @@ package greeter
 
 import (
 	"context"
+	"log/slog"
 	"testing"
-
-	"go.uber.org/zap"
 )
 
 func TestGreet(t *testing.T) {
-	svc := NewService(zap.NewNop())
+	svc := NewService(slog.New(slog.DiscardHandler))
 
 	tests := []struct {
 		name string

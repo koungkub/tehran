@@ -10,9 +10,9 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
     -ldflags "-s -w \
-      -X github.com/koungkub/tehran/internal/platform/version.Version=${VERSION} \
-      -X github.com/koungkub/tehran/internal/platform/version.GitCommit=${COMMIT} \
-      -X github.com/koungkub/tehran/internal/platform/version.BuildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      -X github.com/koungkub/tehran/internal/version.Version=${VERSION} \
+      -X github.com/koungkub/tehran/internal/version.GitCommit=${COMMIT} \
+      -X github.com/koungkub/tehran/internal/version.BuildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     -o /out/tehran ./cmd/tehran
 
 # ---- runtime stage ----

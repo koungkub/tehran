@@ -10,17 +10,17 @@ package greeter
 
 import (
 	"context"
-
-	"go.uber.org/zap"
+	"log/slog"
 )
 
 // Service is the greeter domain logic. It has no knowledge of transports
 // (ConnectRPC, message consumers, …); adapters translate to and from it.
 type Service struct {
-	log *zap.Logger
+	log *slog.Logger
 }
 
-func NewService(log *zap.Logger) *Service {
+// NewService builds the greeter domain service.
+func NewService(log *slog.Logger) *Service {
 	return &Service{log: log}
 }
 

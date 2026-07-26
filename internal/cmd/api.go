@@ -4,7 +4,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/koungkub/tehran/internal/app/api"
-	"github.com/koungkub/tehran/internal/platform/config"
+	"github.com/koungkub/tehran/internal/config"
 )
 
 func newAPICommand() *cobra.Command {

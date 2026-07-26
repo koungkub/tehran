@@ -18,10 +18,13 @@ type Handler struct {
 
 var _ greeterv1connect.GreeterServiceHandler = (*Handler)(nil)
 
+// NewHandler wraps svc in the ConnectRPC adapter.
 func NewHandler(svc *Service) *Handler {
 	return &Handler{svc: svc}
 }
 
+// SayHello implements the generated GreeterService handler by delegating to the
+// domain Service.
 func (h *Handler) SayHello(
 	ctx context.Context,
 	req *connect.Request[greeterv1.SayHelloRequest],
@@ -36,8 +39,9 @@ func (h *Handler) SayHello(
 }
 
 // Register mounts the greeter Connect handler on mux and returns the gRPC
-// service names it serves. It satisfies server.Module, so the app wires
-// greeter in without the server package depending on this one.
+// service names it serves. It satisfies connectrpc.Module structurally — this
+// package never imports it — so the app wires greeter in without the server
+// knowing which domains exist.
 func (h *Handler) Register(mux *http.ServeMux, opts ...connect.HandlerOption) []string {
 	mux.Handle(greeterv1connect.NewGreeterServiceHandler(h, opts...))
 	return []string{greeterv1connect.GreeterServiceName}

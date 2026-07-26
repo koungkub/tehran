@@ -1,3 +1,5 @@
+// Command tehran is the service entrypoint. It does nothing but hand off to the
+// cobra command tree and map its error to an exit code; cobra prints the error.
 package main
 
 import (

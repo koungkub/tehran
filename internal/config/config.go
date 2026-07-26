@@ -1,5 +1,11 @@
 // Package config loads the application configuration with the precedence
 // hardcoded defaults < TOML config file < environment variables < CLI flags.
+//
+// The sections are the library modules' own Config types rather than
+// re-declarations of them: pkg/connectrpc, pkg/ops and pkg/telemetry each own
+// their fields and TOML keys, and this package only decides how they nest, where
+// they are read from, and what the defaults are. That part is specific to this
+// service, which is why config cannot itself live in pkg.
 package config
 
 import (
@@ -10,39 +16,23 @@ import (
 
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
+
+	"github.com/koungkub/tehran/pkg/connectrpc"
+	"github.com/koungkub/tehran/pkg/lifecycle"
+	"github.com/koungkub/tehran/pkg/ops"
+	"github.com/koungkub/tehran/pkg/telemetry"
 )
 
 const envPrefix = "TEHRAN"
 
+// Config is the whole of this service's configuration. Each section is the
+// owning library module's own type.
 type Config struct {
-	Server Server `mapstructure:"server"`
-	Ops    Ops    `mapstructure:"ops"`
-	Otel   Otel   `mapstructure:"otel"`
-	Log    Log    `mapstructure:"log"`
-}
-
-type Server struct {
-	Host            string        `mapstructure:"host"`
-	Port            int           `mapstructure:"port"`
-	ShutdownTimeout time.Duration `mapstructure:"shutdown_timeout"`
-}
-
-type Ops struct {
-	Host string `mapstructure:"host"`
-	Port int    `mapstructure:"port"`
-}
-
-type Otel struct {
-	Enabled     bool    `mapstructure:"enabled"`
-	Endpoint    string  `mapstructure:"endpoint"`
-	Insecure    bool    `mapstructure:"insecure"`
-	SampleRatio float64 `mapstructure:"sample_ratio"`
-	ServiceName string  `mapstructure:"service_name"`
-}
-
-type Log struct {
-	Level  string `mapstructure:"level"`
-	Format string `mapstructure:"format"`
+	Server    connectrpc.Config   `mapstructure:"server"`
+	Ops       ops.Config          `mapstructure:"ops"`
+	Lifecycle lifecycle.Config    `mapstructure:"lifecycle"`
+	Otel      telemetry.Config    `mapstructure:"otel"`
+	Log       telemetry.LogConfig `mapstructure:"log"`
 }
 
 // flagBindings maps viper keys to CLI flag names. A bound flag overrides the
@@ -61,12 +51,19 @@ func Load(configFile string, flags *pflag.FlagSet) (*Config, error) {
 
 	// Layer 1 — defaults. Every key must have one: viper.Unmarshal only walks
 	// registered keys, so a key without a default would be invisible to
-	// env-only overrides via AutomaticEnv.
+	// env-only overrides via AutomaticEnv. That holds for the keys the pkg
+	// modules declare too: those modules substitute their own fallback for a
+	// zero value, but only a registered key can be overridden at all.
 	v.SetDefault("server.host", "0.0.0.0")
 	v.SetDefault("server.port", 8080)
 	v.SetDefault("server.shutdown_timeout", 10*time.Second)
+	v.SetDefault("server.max_request_bytes", connectrpc.DefaultMaxRequestBytes)
+	v.SetDefault("server.read_header_timeout", connectrpc.DefaultReadHeaderTimeout)
 	v.SetDefault("ops.host", "0.0.0.0")
 	v.SetDefault("ops.port", 9090)
+	v.SetDefault("ops.shutdown_timeout", ops.DefaultShutdownTimeout)
+	v.SetDefault("ops.read_header_timeout", ops.DefaultReadHeaderTimeout)
+	v.SetDefault("lifecycle.shutdown_timeout", lifecycle.DefaultShutdownTimeout)
 	v.SetDefault("otel.enabled", true)
 	v.SetDefault("otel.endpoint", "localhost:4317")
 	v.SetDefault("otel.insecure", true)

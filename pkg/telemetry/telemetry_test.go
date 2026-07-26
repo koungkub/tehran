@@ -3,18 +3,17 @@ package telemetry
 import (
 	"context"
 	"testing"
-
-	"github.com/koungkub/tehran/internal/platform/config"
 )
 
 func TestSetupShutdown(t *testing.T) {
 	for _, enabled := range []bool{false, true} {
-		cfg := config.Otel{
-			Enabled:     enabled,
-			Endpoint:    "localhost:4317",
-			Insecure:    true,
-			SampleRatio: 1.0,
-			ServiceName: "tehran-test",
+		cfg := Config{
+			Enabled:        enabled,
+			Endpoint:       "localhost:4317",
+			Insecure:       true,
+			SampleRatio:    1.0,
+			ServiceName:    "tehran-test",
+			ServiceVersion: "test",
 		}
 		tel, err := Setup(context.Background(), cfg)
 		if err != nil {
