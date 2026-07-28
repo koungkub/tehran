@@ -17,6 +17,6 @@ func newRootCommand() *cobra.Command {
 		SilenceUsage: true,
 	}
 	root.PersistentFlags().String("config", "", "path to a TOML config file (default: ./config.toml, /etc/tehran/config.toml)")
-	root.AddCommand(newAPICommand(), newVersionCommand())
+	root.AddCommand(newAPICommand(), newDBCommand(), newVersionCommand())
 	return root
 }

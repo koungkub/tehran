@@ -18,6 +18,7 @@ import (
 	"github.com/koungkub/tehran/internal/greeter"
 	"github.com/koungkub/tehran/internal/version"
 	"github.com/koungkub/tehran/pkg/connectrpc"
+	"github.com/koungkub/tehran/pkg/database"
 	"github.com/koungkub/tehran/pkg/lifecycle"
 	"github.com/koungkub/tehran/pkg/ops"
 	"github.com/koungkub/tehran/pkg/telemetry"
@@ -30,17 +31,23 @@ const telemetryFlushTimeout = 5 * time.Second
 var errDraining = errors.New("draining")
 
 // App is the wired-up api command: the supervisor that runs the servers, the
-// telemetry pipeline, and the readiness flag.
+// telemetry pipeline, the database pool, and the readiness flag.
 type App struct {
-	log   *slog.Logger
-	tel   *telemetry.Telemetry
+	log *slog.Logger
+	tel *telemetry.Telemetry
+	// db is nil when the database section is disabled, which is what lets this
+	// command run with no database at all.
+	db    *database.DB
 	sup   *lifecycle.Supervisor
 	ready atomic.Bool
 }
 
 // New wires the application: telemetry, then the domain services, then the
 // transports in front of them. Nothing is started here — see Run.
-func New(ctx context.Context, cfg *config.Config) (*App, error) {
+//
+// The error is named so that anything opened here can be released when a later
+// step fails: New's caller gets an error and no handle to close things with.
+func New(ctx context.Context, cfg *config.Config) (_ *App, err error) {
 	// The build stamp is linked into this binary, so the telemetry library
 	// cannot reach it; hand it over instead.
 	cfg.Otel.ServiceVersion = version.Version
@@ -54,13 +61,40 @@ func New(ctx context.Context, cfg *config.Config) (*App, error) {
 		return nil, err
 	}
 
-	a := &App{log: log, tel: tel}
+	app := &App{
+		log: log,
+		tel: tel,
+	}
 
 	// 1. Outbound adapters — repositories (persistence) and network clients.
 	//    Construct them here and inject into the business logic below. greeter
 	//    needs neither yet; a domain that does would wire, e.g.:
-	//        accountRepo := postgres.NewAccountRepository(db)
+	//        accountRepo := postgres.NewAccountRepository(app.db.Gorm())
 	//        payClient    := paygate.NewClient(cfg.Paygate)
+	//
+	//    One pool is shared by every repository: it is the service's budget of
+	//    connections to that server, and a pool per domain would multiply it by
+	//    the number of domains.
+	if cfg.Database.Enabled {
+		db, openErr := database.Open(ctx, cfg.Database.Config,
+			database.WithLogger(log),
+			// The provider interfaces again, not the Telemetry struct.
+			database.WithTracerProvider(tel.TracerProvider),
+			database.WithMeterProvider(tel.MeterProvider),
+		)
+		if openErr != nil {
+			return nil, openErr
+		}
+		app.db = db
+		// The pool is open from here on, and only Run closes it. Anything below
+		// that fails would otherwise leave it open with nothing left holding a
+		// reference to it.
+		defer func() {
+			if err != nil {
+				err = errors.Join(err, app.db.Close())
+			}
+		}()
+	}
 
 	// 2. Business logic — shared domain services. Inject the repos/clients
 	//    from step 1 through the constructor as each domain grows.
@@ -82,41 +116,56 @@ func New(ctx context.Context, cfg *config.Config) (*App, error) {
 		return nil, err
 	}
 
-	opsServer := ops.New(cfg.Ops,
+	opsOpts := []ops.Option{
 		ops.WithLogger(log),
 		ops.WithRegistry(tel.PromRegistry),
 		ops.WithReadyCheck("drain", func(context.Context) error {
-			if !a.ready.Load() {
+			if !app.ready.Load() {
 				return errDraining
 			}
 			return nil
 		}),
-	)
+	}
+	if app.db != nil {
+		// Readiness, not liveness: an instance that cannot reach the database
+		// cannot serve, but restarting it will not bring the database back.
+		opsOpts = append(opsOpts, ops.WithReadyCheck(app.db.Name(), app.db.Ping))
+	}
+	opsServer := ops.New(cfg.Ops, opsOpts...)
 
 	// 4. Lifecycle. Registration order is start order and shutdown runs in
 	//    reverse, so ops comes first: it is up before the RPC server and keeps
 	//    answering /readyz and /metrics for the whole time the RPC server is
 	//    draining. Reversing these two would close the probe port first and
 	//    leave an orchestrator blind during the drain.
-	a.sup = lifecycle.New(cfg.Lifecycle,
+	app.sup = lifecycle.New(cfg.Lifecycle,
 		lifecycle.WithLogger(log),
 		lifecycle.WithComponents(opsServer, rpcServer),
 		// Every port is still open when this runs, so a load balancer sees the
 		// instance leave service before anything stops accepting connections.
-		lifecycle.BeforeShutdown(func() { a.ready.Store(false) }),
+		lifecycle.BeforeShutdown(func() { app.ready.Store(false) }),
 	)
-	return a, nil
+	return app, nil
 }
 
 // Run starts the components and blocks until SIGINT/SIGTERM or a component
-// failure, then drains them in reverse order and flushes telemetry.
+// failure, then drains them in reverse order, closes the database and flushes
+// telemetry.
 func (a *App) Run(ctx context.Context) error {
 	a.ready.Store(true)
 	err := a.sup.Run(ctx)
 
-	// After the supervisor returns: everything has stopped, so nothing is still
-	// producing spans or metrics to flush.
+	// The database closes after the supervisor returns rather than as one of its
+	// components: registered as a component it would be shut down partway through
+	// the sequence, pulling the pool out from under handlers that are still
+	// draining. Here every user of it has already stopped.
+	errs := []error{err}
+	if a.db != nil {
+		errs = append(errs, a.db.Close())
+	}
+
+	// Nothing is still producing spans or metrics to flush at this point either.
 	flushCtx, cancel := context.WithTimeout(context.Background(), telemetryFlushTimeout)
 	defer cancel()
-	return errors.Join(err, a.tel.Shutdown(flushCtx))
+	return errors.Join(append(errs, a.tel.Shutdown(flushCtx))...)
 }

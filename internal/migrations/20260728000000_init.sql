@@ -1,0 +1,31 @@
+-- Baseline. It carries no statements on purpose.
+--
+-- goose globs *.sql at the root of the embedded filesystem and refuses to build a
+-- provider when it finds none, so without a file here `tehran db migrate` would
+-- fail on a repository whose domains do not persist anything yet — which is this
+-- one, since greeter has no repository. An empty migration is a case goose
+-- supports explicitly; it is recorded as applied and reports as empty.
+--
+-- Keep it. Once it has been applied anywhere, deleting it leaves that
+-- environment's version table pointing at a file nobody else has, which is the
+-- drift a version table exists to prevent. Add the first real migration beside
+-- it instead:
+--
+--     make migrate-new NAME=create_accounts
+--
+-- Two things about writing one. Each file is wrapped in a transaction, so
+-- `SET LOCAL lock_timeout = '3s'` as the first statement of an Up block is how a
+-- DDL statement is stopped from queueing behind a long read and blocking every
+-- write that arrives after it. And a statement that cannot run in a transaction
+-- at all, CREATE INDEX CONCURRENTLY being the one everybody meets, needs the
+-- no-transaction annotation above the Up annotation — see goose's documentation
+-- for the exact spelling, which cannot be written in this comment because goose
+-- parses every line carrying its annotation marker, comment or not.
+--
+-- Giving up the transaction means giving up atomicity: a concurrent index build
+-- that fails half way leaves an invalid index behind, to be dropped and rebuilt
+-- rather than retried.
+
+-- +goose Up
+
+-- +goose Down

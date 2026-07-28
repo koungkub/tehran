@@ -44,7 +44,9 @@ func WithLogger(log *slog.Logger) Option {
 // shutdown runs in reverse — so register the components others depend on first,
 // and they will be the last to stop. Repeated calls accumulate.
 func WithComponents(components ...Component) Option {
-	return func(o *options) { o.components = append(o.components, components...) }
+	return func(o *options) {
+		o.components = append(o.components, components...)
+	}
 }
 
 // BeforeShutdown registers a function to run once shutdown begins and before any
@@ -69,5 +71,7 @@ func BeforeShutdown(hooks ...func()) Option {
 // when its context is cancelled — which is what a test or an embedded use
 // wants.
 func WithSignals(signals ...os.Signal) Option {
-	return func(o *options) { o.signals = signals }
+	return func(o *options) {
+		o.signals = signals
+	}
 }

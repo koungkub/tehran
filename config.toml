@@ -4,15 +4,124 @@
 [server]
 host = "0.0.0.0"
 port = 8080
-shutdown_timeout = "10s"
-max_request_bytes = 4194304  # 4 MiB cap on a decompressed request message
-read_header_timeout = "10s"  # no read timeout: it would abort streaming RPCs
+max_request_bytes = 4194304 # 4 MiB cap on a decompressed request message
+
+# Timeouts. write_timeout is deliberately absent: it bounds the whole handler
+# plus response, so it would eventually abort a healthy streaming RPC. Most
+# settings below instead bound a *lack of progress*, which is what "broken"
+# actually looks like.
+# Slowloris guard, HTTP/1.1 only: h2 ignores this field. Kept <= read_timeout on
+# purpose — net/http arms the header phase with this value and only swaps to the
+# read_timeout deadline once the headers are in, so a larger value here would let
+# the header phase outrun the whole-request budget below.
+read_header_timeout = "5s"
+idle_timeout = "120s"        # reap conns with no request in flight
+keepalive_interval = "30s"   # HTTP/2 PING after this much silence; drops dead peers
+write_byte_timeout = "30s"   # give up when a write stops making progress
+max_concurrent_streams = 250 # per *connection*, not per client; matches Go's default
+
+# read_timeout bounds one request body's arrival, and is the only thing that
+# stops a slow-body client from pinning a stream and its goroutine indefinitely
+# (nothing else covers that phase: Connect decodes the message before the
+# interceptors run, the h2 idle timer stops once a stream opens, and a peer that
+# answers PINGs defeats keepalive_interval).
+#
+# It is off by default in the library because it would abort a client-streaming
+# upload. It is safe to enable here: greeter serves one unary RPC and no
+# streaming method. Revisit this before adding a client-streaming or bidi RPC.
+read_timeout = "5s"
+
+# These three are chosen together, not independently. Shutdown only closes
+# connections once they go idle and never cancels a handler's context, so a drain
+# shorter than a request means an ordinary SIGTERM cuts requests off and the
+# process exits non-zero. Keep:
+#   read_timeout + request_timeout <= server.shutdown_timeout   (phases are sequential)
+#   server.shutdown_timeout + ops.shutdown_timeout <= lifecycle.shutdown_timeout
+#   lifecycle.shutdown_timeout <  the orchestrator's grace period
+# As set here: 5 + 15 <= 20, and 20 + 5 = 25 < 30, so
+# terminationGracePeriodSeconds should be 35 or more, not the 30s default.
+request_timeout = "15s"  # per-unary-RPC deadline when the client sent none
+shutdown_timeout = "20s" # must cover read_timeout + request_timeout
 
 [ops]
 host = "0.0.0.0"
 port = 9090
 shutdown_timeout = "5s" # short: nothing served here is long-running
 read_header_timeout = "10s"
+
+[database]
+# Off until a domain here persists something: greeter has no repository, so the
+# api command needs no database to start. The first repository turns this on.
+enabled = false
+driver = "postgres" # or "mysql"; anything else is passed in as a dialector
+host = "127.0.0.1"
+port = 5432
+user = "tehran"
+database = "tehran"
+# password is deliberately absent. It belongs in the environment —
+# TEHRAN_DATABASE_PASSWORD — not in a file that is checked in.
+ssl_mode = "disable" # local only; "verify-full" against anything managed
+
+# Pool. database/sql blocks a caller when no connection is free, so this is a
+# queue in front of the database: a saturated pool shows up as requests timing
+# out and db.client.connection.wait.count climbing. max_open_conns is per
+# process, so the server's own max_connections has to cover it times the replica
+# count, plus migrations and operators.
+max_open_conns = 25
+# Left at 0, which means "match max_open_conns". A lower idle limit makes a busy
+# service open and close connections continuously, because database/sql closes
+# any connection returned to a full idle set.
+max_idle_conns = 0
+conn_max_lifetime = "30m" # rotate, so a failover or a DNS change is picked up
+conn_max_idle_time = "5m" # release connections during quiet periods
+
+# connect_timeout bounds the startup ping, every connection the pool opens later,
+# and a /readyz probe (whose request context carries no deadline of its own). Keep
+# it below server.request_timeout: a request that has to open a connection spends
+# this out of its own budget first.
+connect_timeout = "5s"
+slow_query_threshold = "200ms" # above this, a statement is logged at warn
+
+# Both off deliberately. prepare_stmt breaks against a pooler in transaction
+# mode (PgBouncer, RDS Proxy), and include_query_values puts the rows themselves
+# — e-mail addresses, tokens — into logs and traces. Turn the second one on
+# locally, never in production.
+prepare_stmt = false
+include_query_values = false
+
+# Read by `tehran db migrate` and by nothing the api server does. Migrations are
+# a separate process invocation on purpose: the server starts N replicas at once,
+# and its role should not be allowed to ALTER anything.
+[migrate]
+# Absent deliberately: the dialect follows database.driver, so it cannot drift
+# from the pool it runs through. Set it only for a driver pkg/database does not
+# name — then the two become yours to keep consistent.
+# dialect = "postgres"
+table_name = "goose_db_version"
+
+# How two runners starting at once are kept apart. "session" takes a PostgreSQL
+# advisory lock, held on one connection for the run and released by the server if
+# the process dies. Use "table" behind a pooler in transaction mode (PgBouncer,
+# RDS Proxy), where consecutive statements are not guaranteed the same session and
+# an advisory lock taken on one connection is invisible from the next. "none" runs
+# unlocked, and is the only option on MySQL — goose implements no locker for it,
+# so anything else is refused at startup rather than silently downgraded.
+lock_mode = "session"
+lock_id = 4097083626 # goose's own, so the CLI locks against the same identifier
+# Has to cover the *other* runner's whole migration, not just its startup: two
+# replicas of a migration Job racing is what this is for, and the loser waiting
+# five minutes is the correct outcome. Rounded up to a multiple of 5s.
+lock_wait = "5m"
+
+# Off. Two branches merging with interleaved versions is exactly the case where
+# applying quietly leaves two environments on the same version number with a
+# different schema.
+allow_out_of_order = false
+
+# Off, and the one duration here where 0 does not mean "use the default". A bound
+# low enough to catch a hung migration is also low enough to cut a legitimate
+# CREATE INDEX CONCURRENTLY short. Let the job's own deadline be the backstop.
+timeout = "0s"
 
 [lifecycle]
 # Backstop over the whole ordered shutdown; should exceed the sum of the
