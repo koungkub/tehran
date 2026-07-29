@@ -1,8 +1,10 @@
 package connectrpc
 
 import (
+	"bytes"
 	"context"
-	"log/slog"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -12,6 +14,8 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"connectrpc.com/grpchealth"
+	"github.com/rs/zerolog"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -49,38 +53,52 @@ func echo(_ context.Context, req *echoRequest) (*echoResponse, error) {
 	return connect.NewResponse(wrapperspb.String(req.Msg.GetValue())), nil
 }
 
-// captureHandler records what reaches the logger, including whether the context
-// carried a span at that point.
-type captureHandler struct {
+// capture records what reaches the logger, as one flat map of strings per line.
+//
+// It is the logger's writer, so it sees exactly the JSON a real deployment would
+// — which is also why the trace id has to be put on the record by a hook rather
+// than read from a context here: by the time a line reaches a writer there is no
+// context left to read.
+type capture struct {
 	mu      sync.Mutex
 	records []map[string]string
 }
 
-func (h *captureHandler) Enabled(context.Context, slog.Level) bool { return true }
-
-func (h *captureHandler) Handle(ctx context.Context, rec slog.Record) error {
-	fields := map[string]string{"msg": rec.Message, "level": rec.Level.String()}
-	rec.Attrs(func(a slog.Attr) bool {
-		fields[a.Key] = a.Value.String()
-		return true
-	})
-	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
-		fields["trace_id"] = sc.TraceID().String()
+func (c *capture) Write(p []byte) (int, error) {
+	decoded := map[string]any{}
+	dec := json.NewDecoder(bytes.NewReader(p))
+	dec.UseNumber() // Keep durations and counts as they were written.
+	if err := dec.Decode(&decoded); err != nil {
+		return len(p), nil // Not a record this test cares about.
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.records = append(h.records, fields)
-	return nil
+	fields := make(map[string]string, len(decoded))
+	for k, v := range decoded {
+		fields[k] = fmt.Sprint(v)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.records = append(c.records, fields)
+	return len(p), nil
 }
 
-func (h *captureHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
-func (h *captureHandler) WithGroup(string) slog.Handler      { return h }
+// logger wires the capture up the way telemetry.NewLogger does: the trace id
+// comes from a hook reading the event's context, which is what makes these tests
+// fail if an interceptor stops passing one.
+func (c *capture) logger() *zerolog.Logger {
+	l := zerolog.New(c).Level(zerolog.TraceLevel).Hook(zerolog.HookFunc(
+		func(e *zerolog.Event, _ zerolog.Level, _ string) {
+			if sc := trace.SpanContextFromContext(e.GetCtx()); sc.IsValid() {
+				e.Str("trace_id", sc.TraceID().String())
+			}
+		}))
+	return &l
+}
 
-func (h *captureHandler) find(msg string) map[string]string {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	for _, r := range h.records {
-		if r["msg"] == msg {
+func (c *capture) find(msg string) map[string]string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, r := range c.records {
+		if r["message"] == msg {
 			return r
 		}
 	}
@@ -90,10 +108,10 @@ func (h *captureHandler) find(msg string) map[string]string {
 // waitFor polls for a log line. The interceptors log after the handler returns,
 // so a client that gave up on its own — a cancellation — can be back before the
 // line exists.
-func (h *captureHandler) waitFor(t *testing.T, msg string) map[string]string {
+func (c *capture) waitFor(t *testing.T, msg string) map[string]string {
 	t.Helper()
 	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
-		if rec := h.find(msg); rec != nil {
+		if rec := c.find(msg); rec != nil {
 			return rec
 		}
 		time.Sleep(5 * time.Millisecond)
@@ -102,24 +120,30 @@ func (h *captureHandler) waitFor(t *testing.T, msg string) map[string]string {
 	return nil
 }
 
+// discard is a logger for the tests that assert on behaviour rather than output.
+func discard() *zerolog.Logger {
+	l := zerolog.Nop()
+	return &l
+}
+
 // newTestServer builds a Server and a client that talks to it through httptest,
 // which avoids binding a port. The Connect protocol works over HTTP/1.1, so no
 // h2c is needed here.
 func newTestServer(t *testing.T, module echoModule, opts ...Option) (
-	*Server, *connect.Client[wrapperspb.StringValue, wrapperspb.StringValue], *captureHandler,
+	*Server, *connect.Client[wrapperspb.StringValue, wrapperspb.StringValue], *capture,
 ) {
 	t.Helper()
 	return newConfiguredTestServer(t, Config{}, module, opts...)
 }
 
 func newConfiguredTestServer(t *testing.T, cfg Config, module echoModule, opts ...Option) (
-	*Server, *connect.Client[wrapperspb.StringValue, wrapperspb.StringValue], *captureHandler,
+	*Server, *connect.Client[wrapperspb.StringValue, wrapperspb.StringValue], *capture,
 ) {
 	t.Helper()
-	capture := &captureHandler{}
+	recorder := &capture{}
 	opts = append([]Option{
 		WithModules(module),
-		WithLogger(slog.New(capture)),
+		WithLogger(recorder.logger()),
 	}, opts...)
 
 	srv, err := New(cfg, opts...)
@@ -132,7 +156,7 @@ func newConfiguredTestServer(t *testing.T, cfg Config, module echoModule, opts .
 	client := connect.NewClient[wrapperspb.StringValue, wrapperspb.StringValue](
 		ts.Client(), ts.URL+testProcedure,
 	)
-	return srv, client, capture
+	return srv, client, recorder
 }
 
 func TestServerRoundTrip(t *testing.T) {
@@ -234,7 +258,7 @@ func TestServeStopsOnContextCancel(t *testing.T) {
 	srv, err := New(
 		Config{Host: "127.0.0.1", ShutdownTimeout: 2 * time.Second},
 		WithModules(echoModule{fn: echo}),
-		WithLogger(slog.New(slog.DiscardHandler)),
+		WithLogger(discard()),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -260,7 +284,7 @@ func TestServeStopsOnContextCancel(t *testing.T) {
 
 func TestServeReportsBindFailure(t *testing.T) {
 	// Port 1 is privileged, so binding it fails for a normal test process.
-	srv, err := New(Config{Host: "127.0.0.1", Port: 1}, WithLogger(slog.New(slog.DiscardHandler)))
+	srv, err := New(Config{Host: "127.0.0.1", Port: 1}, WithLogger(discard()))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -334,7 +358,7 @@ func TestProgressBasedTimeoutsAreWired(t *testing.T) {
 		WriteByteTimeout:     5 * time.Second,
 		MaxConcurrentStreams: 7,
 	}
-	srv, err := New(cfg, WithLogger(slog.New(slog.DiscardHandler)))
+	srv, err := New(cfg, WithLogger(discard()))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -476,7 +500,7 @@ func TestHealthAndReflectionAreNotReportedAsRejected(t *testing.T) {
 // pins a stream indefinitely, so a service that serves no client-streaming RPC
 // wants this on.
 func TestReadTimeoutIsOptInAndWired(t *testing.T) {
-	off, err := New(Config{}, WithLogger(slog.New(slog.DiscardHandler)))
+	off, err := New(Config{}, WithLogger(discard()))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -484,12 +508,85 @@ func TestReadTimeoutIsOptInAndWired(t *testing.T) {
 		t.Errorf("ReadTimeout = %v, want 0: withDefaults must not switch it on", off.http.ReadTimeout)
 	}
 
-	on, err := New(Config{ReadTimeout: 3 * time.Second}, WithLogger(slog.New(slog.DiscardHandler)))
+	// ReadHeaderTimeout has to come down with it: its 10s default is above this,
+	// and New refuses that pair. See TestReadHeaderTimeoutMustFitReadTimeout.
+	on, err := New(
+		Config{ReadTimeout: 3 * time.Second, ReadHeaderTimeout: time.Second},
+		WithLogger(discard()),
+	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	if on.http.ReadTimeout != 3*time.Second {
 		t.Errorf("ReadTimeout = %v, want 3s", on.http.ReadTimeout)
+	}
+}
+
+// TestReadHeaderTimeoutMustFitReadTimeout pins the check that caught this
+// package's own test writing an incoherent pair.
+//
+// net/http arms the header phase with ReadHeaderTimeout and swaps to the
+// ReadTimeout deadline only once the headers are read. Set the header budget
+// higher and the header phase can outlive the whole-request budget, so the body
+// phase begins on a deadline that has already passed — a failure that looks like
+// the client's fault and is not. Switching ReadTimeout on while leaving
+// ReadHeaderTimeout at its 10s default is the ordinary way to arrive there, so
+// the pair is refused rather than quietly reordered.
+func TestReadHeaderTimeoutMustFitReadTimeout(t *testing.T) {
+	if _, err := New(Config{ReadTimeout: 3 * time.Second}, WithLogger(discard())); err == nil {
+		t.Error("New accepted the 10s default header timeout under a 3s read timeout")
+	}
+	// Equal is fine: the header phase may use the whole budget as long as it does
+	// not outlast it.
+	if _, err := New(
+		Config{ReadTimeout: 5 * time.Second, ReadHeaderTimeout: 5 * time.Second},
+		WithLogger(discard()),
+	); err != nil {
+		t.Errorf("New rejected an equal pair: %v", err)
+	}
+	// With ReadTimeout off there is no whole-request budget to outlive, so the
+	// header timeout stands alone and any value is coherent.
+	if _, err := New(
+		Config{ReadHeaderTimeout: time.Hour},
+		WithLogger(discard()),
+	); err != nil {
+		t.Errorf("New rejected a header timeout with no read timeout to exceed: %v", err)
+	}
+}
+
+// TestSetServingFlipsGRPCHealth covers the drain signal a gRPC-native load
+// balancer watches. ops' /readyz answers an orchestrator over HTTP and does not
+// reach this: the health service starts at SERVING and nothing else moves it, so
+// without SetServing a client watching grpc.health.v1.Health keeps routing here
+// for the whole drain.
+func TestSetServingFlipsGRPCHealth(t *testing.T) {
+	srv, err := New(Config{}, WithModules(&echoModule{}), WithLogger(discard()))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	http := httptest.NewServer(srv.Handler())
+	t.Cleanup(http.Close)
+
+	check := func() grpchealth.Status {
+		t.Helper()
+		client := grpchealth.NewClient(http.Client(), http.URL, connect.WithGRPC())
+		res, err := client.Check(t.Context(), &grpchealth.CheckRequest{Service: testService})
+		if err != nil {
+			t.Fatalf("health check: %v", err)
+		}
+		return res.Status
+	}
+
+	if got := check(); got != grpchealth.StatusServing {
+		t.Fatalf("status = %v, want %v before a drain", got, grpchealth.StatusServing)
+	}
+	srv.SetServing(false)
+	if got := check(); got != grpchealth.StatusNotServing {
+		t.Errorf("status = %v, want %v once draining", got, grpchealth.StatusNotServing)
+	}
+	srv.SetServing(true)
+	if got := check(); got != grpchealth.StatusServing {
+		t.Errorf("status = %v, want %v once serving again", got, grpchealth.StatusServing)
 	}
 }
 

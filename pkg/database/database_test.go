@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"io"
-	"log/slog"
 	"net/url"
 	"strings"
 	"testing"
@@ -13,14 +12,16 @@ import (
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
 	mysqldriver "github.com/go-sql-driver/mysql"
+	"github.com/rs/zerolog"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
 // quiet keeps a test's own output to its assertions. Passing it explicitly also
-// stops these tests from depending on slog's default handler.
-func quiet() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
+// stops these tests from depending on zerolog's package-level logger.
+func quiet() *zerolog.Logger {
+	l := zerolog.New(io.Discard)
+	return &l
 }
 
 // withMockDialector is WithDialector's reason for existing, used as intended: a
@@ -84,6 +85,13 @@ func TestConfigDefaults(t *testing.T) {
 	}
 	if got := (Config{MaxOpenConns: 4}).withDefaults(); got.MaxIdleConns != 4 {
 		t.Errorf("MaxIdleConns = %d, want it to follow an explicit MaxOpenConns (4)", got.MaxIdleConns)
+	}
+	// database/sql caps the idle set at MaxOpenConns whatever it is told, so a
+	// larger value is not a pool holding more idle connections — it is only a
+	// number that disagrees with the pool, and db.client.connection.idle.max
+	// reports it because database/sql exposes no way to read the real one back.
+	if got := (Config{MaxOpenConns: 4, MaxIdleConns: 40}).withDefaults(); got.MaxIdleConns != 4 {
+		t.Errorf("MaxIdleConns = %d, want it clamped to MaxOpenConns (4)", got.MaxIdleConns)
 	}
 }
 

@@ -1,7 +1,8 @@
 package migrate
 
 import (
-	"log/slog"
+	"github.com/rs/zerolog"
+	zlog "github.com/rs/zerolog/log"
 
 	"github.com/pressly/goose/v3"
 )
@@ -11,24 +12,27 @@ import (
 type Option func(*options)
 
 type options struct {
-	log          *slog.Logger
+	log          *zerolog.Logger
 	goMigrations []*goose.Migration
 }
 
 func newOptions(opts []Option) options {
 	// The default keeps New usable with no options at all, sending migration
-	// records wherever slog's default handler points.
-	o := options{log: slog.Default()}
+	// records wherever zerolog's package-level logger points.
+	o := options{log: &zlog.Logger}
 	for _, opt := range opts {
 		opt(&o)
 	}
 	return o
 }
 
-// WithLogger sets the logger migrations are reported through — one record per
-// migration, carrying its source, direction and duration. Defaults to
-// slog.Default().
-func WithLogger(log *slog.Logger) Option {
+// WithLogger sets the logger migrations are reported through — one line per
+// migration, naming its source, direction and duration. Defaults to zerolog's
+// package-level logger.
+//
+// goose renders those details into the message rather than into fields; see
+// gooseLogger for why.
+func WithLogger(log *zerolog.Logger) Option {
 	return func(o *options) {
 		if log != nil {
 			o.log = log

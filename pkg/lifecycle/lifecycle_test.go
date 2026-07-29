@@ -3,13 +3,21 @@ package lifecycle
 import (
 	"context"
 	"errors"
-	"log/slog"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/rs/zerolog"
 )
+
+// discard keeps these tests off whatever zerolog's package-level logger
+// happens to point at; they assert on behaviour, not on output.
+func discard() *zerolog.Logger {
+	l := zerolog.Nop()
+	return &l
+}
 
 // journal records lifecycle events across goroutines so a test can assert the
 // order they happened in.
@@ -74,7 +82,7 @@ func (s *stub) Serve(ctx context.Context) error {
 func newSupervisor(t *testing.T, cfg Config, components ...Component) *Supervisor {
 	t.Helper()
 	return New(cfg,
-		WithLogger(slog.New(slog.DiscardHandler)),
+		WithLogger(discard()),
 		WithSignals(),
 		WithComponents(components...),
 	)
@@ -140,7 +148,7 @@ func TestStopsInReverseRegistrationOrder(t *testing.T) {
 func TestBeforeShutdownRunsBeforeAnythingStops(t *testing.T) {
 	j := &journal{}
 	sup := New(Config{},
-		WithLogger(slog.New(slog.DiscardHandler)),
+		WithLogger(discard()),
 		WithSignals(),
 		WithComponents(&stub{name: "ops", j: j}, &stub{name: "rpc", j: j}),
 		BeforeShutdown(func() { j.add("readiness off") }),
@@ -240,8 +248,41 @@ func TestShutdownTimeoutNamesStuckComponents(t *testing.T) {
 	}
 }
 
+// TestShutdownTimeoutCoversTheHooks pins where the shutdown clock starts.
+//
+// Config.ShutdownTimeout is documented as a bound on the whole ordered
+// shutdown, and BeforeShutdown hooks run inside it. Started only once the hooks
+// are done, the clock would hand the drain a full fresh budget however long they
+// took, so the real sequence could run to hooks + timeout — past the
+// orchestrator's grace period, which ends in SIGKILL and no drain at all.
+//
+// The numbers are chosen so only the bug can pass: a 250ms hook leaves 50ms of
+// the 300ms budget for a component that needs 150ms to drain, so the backstop
+// must fire. Start the clock after the hook and the same component drains
+// comfortably inside a fresh 300ms and Run returns nil.
+func TestShutdownTimeoutCoversTheHooks(t *testing.T) {
+	j := &journal{}
+	sup := New(Config{ShutdownTimeout: 300 * time.Millisecond},
+		WithLogger(discard()),
+		WithSignals(),
+		WithComponents(&stub{name: "slow-drain", j: j, drain: 150 * time.Millisecond}),
+		BeforeShutdown(func() { time.Sleep(250 * time.Millisecond) }),
+	)
+
+	cancel, done := runUntilServing(t, sup, j, 1)
+	cancel()
+
+	err := waitFor(t, done)
+	if err == nil {
+		t.Fatal("Run = nil: the hook's 250ms was not charged to the 300ms budget")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Errorf("error %q does not mention the timeout", err)
+	}
+}
+
 func TestRunWithoutComponents(t *testing.T) {
-	sup := New(Config{}, WithLogger(slog.New(slog.DiscardHandler)), WithSignals())
+	sup := New(Config{}, WithLogger(discard()), WithSignals())
 	if err := sup.Run(context.Background()); !errors.Is(err, ErrNoComponents) {
 		t.Errorf("Run = %v, want %v", err, ErrNoComponents)
 	}

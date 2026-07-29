@@ -13,11 +13,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net"
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/rs/zerolog"
 
 	"connectrpc.com/connect"
 	"connectrpc.com/grpchealth"
@@ -215,8 +216,13 @@ type Server struct {
 	http *http.Server
 	// mux is the bare router, kept because http.Handler wraps it in middleware:
 	// tests assert on routing, which needs the mux rather than the wrapper.
-	mux             *http.ServeMux
-	log             *slog.Logger
+	mux *http.ServeMux
+	// health and services back SetServing. The checker is static in the sense
+	// that it holds a status per service rather than computing one, not in the
+	// sense that the status never changes.
+	health          *grpchealth.StaticChecker
+	services        []string
+	log             *zerolog.Logger
 	name            string
 	shutdownTimeout time.Duration
 }
@@ -229,10 +235,36 @@ func New(cfg Config, opts ...Option) (*Server, error) {
 	cfg = cfg.withDefaults()
 	o := newOptions(opts)
 
-	otelInterceptor, err := otelconnect.NewInterceptor(
+	// net/http arms the header phase with ReadHeaderTimeout and swaps to the
+	// ReadTimeout deadline only once the headers are read, so a larger value here
+	// lets the header phase outlive the whole-request budget and leaves the body
+	// phase starting on a deadline that has already passed. Refused rather than
+	// clamped: the pair is a deliberate choice, and silently moving one of them
+	// would hide that the configuration says something its author did not mean.
+	if cfg.ReadTimeout > 0 && cfg.ReadHeaderTimeout > cfg.ReadTimeout {
+		return nil, fmt.Errorf(
+			"connectrpc: read_header_timeout (%s) exceeds read_timeout (%s): "+
+				"the header phase would outlive the whole-request budget, leaving the body "+
+				"phase to start on an expired deadline",
+			cfg.ReadHeaderTimeout, cfg.ReadTimeout)
+	}
+
+	otelOpts := []otelconnect.Option{
 		otelconnect.WithTracerProvider(o.tracerProvider),
 		otelconnect.WithMeterProvider(o.meterProvider),
-	)
+		// Without this, otelconnect puts net.peer.name and net.peer.port on every
+		// server span *and* on the five RPC metrics it records. The peer port is a
+		// fresh ephemeral number per connection, so each one mints a new attribute
+		// set — and the Prometheus reader is pull-based, so the SDK retains every
+		// set it has ever seen. That is an unbounded /metrics body and unbounded
+		// memory, from ordinary traffic. otelconnect's own documentation calls the
+		// default "very high-cardinality"; the peer is still on the rpc log line.
+		otelconnect.WithoutServerPeerAttributes(),
+	}
+	if o.trustRemoteSpans {
+		otelOpts = append(otelOpts, otelconnect.WithTrustRemote())
+	}
+	otelInterceptor, err := otelconnect.NewInterceptor(otelOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("create otel interceptor: %w", err)
 	}
@@ -294,6 +326,8 @@ func New(cfg Config, opts ...Option) (*Server, error) {
 		log:             o.log,
 		name:            o.name,
 		mux:             mux,
+		health:          checker,
+		services:        serviceNames,
 		shutdownTimeout: cfg.ShutdownTimeout,
 		http: &http.Server{
 			Addr: net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)),
@@ -327,8 +361,7 @@ func New(cfg Config, opts ...Option) (*Server, error) {
 func (s *Server) Serve(ctx context.Context) error {
 	errCh := make(chan error, 1)
 	go func() {
-		s.log.LogAttrs(ctx, slog.LevelInfo, s.name+" server listening",
-			slog.String("addr", s.Addr()))
+		s.log.Info().Ctx(ctx).Str("addr", s.Addr()).Msg(s.name + " server listening")
 		err := s.http.ListenAndServe()
 		if errors.Is(err, http.ErrServerClosed) {
 			err = nil
@@ -344,8 +377,8 @@ func (s *Server) Serve(ctx context.Context) error {
 	case <-ctx.Done():
 	}
 
-	s.log.LogAttrs(ctx, slog.LevelInfo, s.name+" server shutting down",
-		slog.Duration("timeout", s.shutdownTimeout))
+	s.log.Info().Ctx(ctx).Dur("timeout", s.shutdownTimeout).
+		Msg(s.name + " server shutting down")
 	// A fresh context: ctx is already cancelled, and Shutdown needs a live
 	// deadline to drain within.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout)
@@ -365,6 +398,32 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 // Name identifies the server to a supervisor and labels its log lines.
 func (s *Server) Name() string { return s.name }
+
+// SetServing sets the gRPC health status of every registered service, and the
+// server-wide status a check that names no service gets.
+//
+// Call it with false at the start of a shutdown, alongside whatever flips
+// ops' /readyz — the two answer different clients and neither covers the other.
+// An orchestrator polls /readyz over HTTP; a gRPC-native load balancer watches
+// grpc.health.v1.Health/Watch and would otherwise keep routing here for the
+// whole drain, because the status starts at SERVING and nothing else moves it.
+//
+// It is safe to call concurrently with the checks it affects, and a lifecycle
+// hook is the natural place:
+//
+//	lifecycle.BeforeShutdown(func() { rpc.SetServing(false) })
+func (s *Server) SetServing(serving bool) {
+	status := grpchealth.StatusNotServing
+	if serving {
+		status = grpchealth.StatusServing
+	}
+	for _, name := range s.services {
+		s.health.SetStatus(name, status)
+	}
+	// The empty name is the server-wide status, which is what a check that asks
+	// about no particular service is answered with.
+	s.health.SetStatus("", status)
+}
 
 // Handler returns the server's whole handler: every module, health and
 // reflection handler mounted, behind the middleware that reports requests which

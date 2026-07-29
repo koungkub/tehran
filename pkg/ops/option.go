@@ -2,9 +2,10 @@ package ops
 
 import (
 	"context"
-	"log/slog"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/rs/zerolog"
+	zlog "github.com/rs/zerolog/log"
 )
 
 // Option configures a Server. The set is closed: only this package can define
@@ -19,13 +20,13 @@ type readyCheck struct {
 
 type options struct {
 	name        string
-	log         *slog.Logger
+	log         *zerolog.Logger
 	registry    *prometheus.Registry
 	readyChecks []readyCheck
 }
 
 func newOptions(opts []Option) options {
-	o := options{name: DefaultName, log: slog.Default()}
+	o := options{name: DefaultName, log: &zlog.Logger}
 	for _, opt := range opts {
 		opt(&o)
 	}
@@ -42,9 +43,9 @@ func WithName(name string) Option {
 	}
 }
 
-// WithLogger sets the logger used for lifecycle events. Defaults to
-// slog.Default().
-func WithLogger(log *slog.Logger) Option {
+// WithLogger sets the logger used for lifecycle events. Defaults to zerolog's
+// package-level logger.
+func WithLogger(log *zerolog.Logger) Option {
 	return func(o *options) {
 		if log != nil {
 			o.log = log

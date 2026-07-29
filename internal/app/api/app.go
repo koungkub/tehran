@@ -10,9 +10,10 @@ package api
 import (
 	"context"
 	"errors"
-	"log/slog"
 	"sync/atomic"
 	"time"
+
+	"github.com/rs/zerolog"
 
 	"github.com/koungkub/tehran/internal/config"
 	"github.com/koungkub/tehran/internal/greeter"
@@ -33,7 +34,7 @@ var errDraining = errors.New("draining")
 // App is the wired-up api command: the supervisor that runs the servers, the
 // telemetry pipeline, the database pool, and the readiness flag.
 type App struct {
-	log *slog.Logger
+	log *zerolog.Logger
 	tel *telemetry.Telemetry
 	// db is nil when the database section is disabled, which is what lets this
 	// command run with no database at all.
@@ -56,7 +57,10 @@ func New(ctx context.Context, cfg *config.Config) (_ *App, err error) {
 	if err != nil {
 		return nil, err
 	}
-	tel, err := telemetry.Setup(ctx, cfg.Otel)
+	// The logger goes in so that a failed span export is reported on the
+	// service's own stream at a level something can filter on, rather than
+	// through the standard library's log package with no level at all.
+	tel, err := telemetry.Setup(ctx, cfg.Otel, telemetry.WithErrorLogger(log))
 	if err != nil {
 		return nil, err
 	}
@@ -143,7 +147,15 @@ func New(ctx context.Context, cfg *config.Config) (_ *App, err error) {
 		lifecycle.WithComponents(opsServer, rpcServer),
 		// Every port is still open when this runs, so a load balancer sees the
 		// instance leave service before anything stops accepting connections.
-		lifecycle.BeforeShutdown(func() { app.ready.Store(false) }),
+		//
+		// Both signals, because they answer different clients: an orchestrator
+		// polls /readyz over HTTP, while a gRPC-native balancer watches
+		// grpc.health.v1.Health and would otherwise be told SERVING for the whole
+		// drain.
+		lifecycle.BeforeShutdown(func() {
+			app.ready.Store(false)
+			rpcServer.SetServing(false)
+		}),
 	)
 	return app, nil
 }

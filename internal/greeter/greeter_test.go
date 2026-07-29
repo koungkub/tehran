@@ -2,12 +2,17 @@ package greeter
 
 import (
 	"context"
-	"log/slog"
 	"testing"
+
+	"github.com/rs/zerolog"
 )
 
+// nopLogger keeps these tests off whatever zerolog's package-level logger
+// happens to point at.
+var nopLogger = zerolog.Nop()
+
 func TestGreet(t *testing.T) {
-	svc := NewService(slog.New(slog.DiscardHandler))
+	svc := NewService(&nopLogger)
 
 	tests := []struct {
 		name string

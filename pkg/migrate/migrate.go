@@ -26,12 +26,12 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"log/slog"
 	"math"
 	"time"
 
 	"github.com/pressly/goose/v3"
 	"github.com/pressly/goose/v3/lock"
+	"github.com/rs/zerolog"
 )
 
 // Dialects with a lock implementation behind them. Config.Dialect accepts any
@@ -149,7 +149,14 @@ func (c Config) lockRetries() uint64 {
 }
 
 // lockOption builds the provider option for LockMode, or nil for LockModeNone.
-func (c Config) lockOption(log *slog.Logger) (goose.ProviderOption, error) {
+//
+// The table locker is built without a logger: goose's lock.WithTableLogger takes
+// a *slog.Logger and has no other form, so there is nothing to hand it here. It
+// then installs its own error-level text handler onto stderr, which means a
+// contended table lease reports outside this service's log stream and format.
+// That is confined to LockModeTable — LockModeSession, the default, has no
+// logger at all — and to errors.
+func (c Config) lockOption() (goose.ProviderOption, error) {
 	switch c.LockMode {
 	case LockModeNone:
 		return nil, nil
@@ -175,7 +182,6 @@ func (c Config) lockOption(log *slog.Logger) (goose.ProviderOption, error) {
 			lock.WithTableName(c.TableName+"_lock"),
 			lock.WithTableLockID(c.LockID),
 			lock.WithTableLockTimeout(lockRetryPeriod, c.lockRetries()),
-			lock.WithTableLogger(log),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("migrate: table locker: %w", err)
@@ -246,7 +252,7 @@ type Migrator struct {
 	// They can see a schema mid-migration instead, which for a diagnostic beats a
 	// five-minute wait.
 	reader  *goose.Provider
-	log     *slog.Logger
+	log     *zerolog.Logger
 	timeout time.Duration
 	target  string
 }
@@ -270,15 +276,19 @@ func New(db *sql.DB, fsys fs.FS, cfg Config, opts ...Option) (*Migrator, error) 
 	// Shared by both providers below. Everything that decides *what* the
 	// migrations are belongs here; only locking differs between them.
 	baseOpts := []goose.ProviderOption{
-		// WithSlog rather than WithLogger: one migration per record, with the
-		// source, direction and duration as attributes, in whatever stream and
-		// format the service already logs to. The two are mutually exclusive in
-		// goose, and this package exposes no logger type of its own.
-		goose.WithSlog(o.log),
+		// WithLogger rather than WithSlog: this package's logger is a
+		// *zerolog.Logger and goose's structured option takes a *slog.Logger
+		// only, so the two are bridged by the Printf adapter below. The cost is
+		// that goose's own fields — source, direction, duration_seconds, state —
+		// arrive as part of a formatted message rather than as attributes, since
+		// goose renders a separate legacy string for this path. The lines still
+		// land in whatever stream and format the service already logs to, which
+		// is the part that matters for a deploy's record.
+		goose.WithLogger(gooseLogger{log: o.log}),
 		// Not a knob. goose gates every log line on this flag, so without it
-		// WithSlog above is wired to nothing and a migration run is silent — and
-		// applying a schema change is a rare, irreversible event whose record is
-		// the only account of what a deploy did to the database.
+		// WithLogger above is wired to nothing and a migration run is silent —
+		// and applying a schema change is a rare, irreversible event whose record
+		// is the only account of what a deploy did to the database.
 		goose.WithVerbose(true),
 		goose.WithTableName(cfg.TableName),
 		goose.WithAllowOutofOrder(cfg.AllowOutOfOrder),
@@ -286,7 +296,7 @@ func New(db *sql.DB, fsys fs.FS, cfg Config, opts ...Option) (*Migrator, error) 
 	if len(o.goMigrations) > 0 {
 		baseOpts = append(baseOpts, goose.WithGoMigrations(o.goMigrations...))
 	}
-	lockOpt, err := cfg.lockOption(o.log)
+	lockOpt, err := cfg.lockOption()
 	if err != nil {
 		return nil, err
 	}

@@ -48,6 +48,10 @@ host = "0.0.0.0"
 port = 9090
 shutdown_timeout = "5s" # short: nothing served here is long-running
 read_header_timeout = "10s"
+# Set explicitly: net/http falls back to read_timeout when this is zero, and
+# nothing sets one here, so leaving it out means no idle timeout at all. Every
+# caller on this port (scraper, probes) is a keep-alive client.
+idle_timeout = "120s"
 
 [database]
 # Off until a domain here persists something: greeter has no repository, so the
@@ -139,3 +143,10 @@ service_name = "tehran"
 [log]
 level = "info"     # zerolog level: trace, debug, info, warn, error, fatal, panic
 format = "console" # "json" in production
+# Adds file:line to every record, through zerolog's own caller hook. Off, because
+# it is the most expensive thing on a log line by a wide margin — roughly four
+# times the cost of the rest of a four-field record — and it earns little here:
+# every message this service emits is already unique to one call site, and the
+# per-RPC lines carry `procedure`, which identifies the code better than a
+# file:line would. The value is zerolog's full build-time path.
+caller = false

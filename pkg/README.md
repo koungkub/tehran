@@ -22,11 +22,17 @@ import (
 | `database` | A GORM handle over a tuned connection pool, with a bounded startup connect, per-statement logs and spans, pool metrics, and a readiness probe |
 | `migrate` | Versioned SQL migrations over goose, embedded in the binary, with concurrent runners locked apart and a half-finished run reporting what it applied |
 | `lifecycle` | Runs components concurrently and stops them in reverse registration order, with signal handling and a shutdown backstop |
-| `telemetry` | OTLP tracing, Prometheus-bridged metrics, and a `*slog.Logger` whose records carry the active `trace_id` and `span_id` |
+| `telemetry` | OTLP tracing, Prometheus-bridged metrics, and a `*zerolog.Logger` whose records carry the active `trace_id` and `span_id` |
 
 ## Using it
 
 ```go
+log, err := telemetry.NewLogger(telemetry.LogConfig{Level: "info", Format: "json"})
+// log is a *zerolog.Logger. Pass a context or the line carries no trace_id:
+//     log.Info().Ctx(ctx).Str("account", id).Msg("charged")
+
+// The logger first, so Setup can report OTel's own failures on it — see
+// "OTel's own errors" below for what happens without that.
 tel, err := telemetry.Setup(ctx, telemetry.Config{
     ServiceName:    "billing",
     ServiceVersion: version.Version, // your ldflags stamp
@@ -34,8 +40,7 @@ tel, err := telemetry.Setup(ctx, telemetry.Config{
     Endpoint:       "localhost:4317",
     Insecure:       true,
     SampleRatio:    1.0,
-})
-log, err := telemetry.NewLogger(telemetry.LogConfig{Level: "info", Format: "json"})
+}, telemetry.WithErrorLogger(log))
 
 rpc, err := connectrpc.New(connectrpc.Config{Host: "0.0.0.0", Port: 8080},
     connectrpc.WithModules(billingAPI),  // anything with a Register method
@@ -86,6 +91,30 @@ to satisfy it. `BeforeShutdown` hooks run while every port is still open, which
 is what makes the readiness flip observable. `Config.ShutdownTimeout` is a
 backstop over the entire sequence, not a per-component drain budget: exceed it
 and `Run` returns an error naming every component still running.
+
+**The hooks spend that budget too.** The clock starts before the first one, so
+whatever they take comes out of the components' drain — started after them
+instead, a slow hook would hand the drain a full fresh budget and the real
+sequence could run to hooks + timeout, past the grace period, ending in SIGKILL
+and no drain at all. Being on `Run`'s goroutine, a hook that never returns is not
+preempted by the timeout either: it stops the shutdown where it stands. Keep them
+to setting a flag. `TestShutdownTimeoutCoversTheHooks` fails if the clock moves
+back after them.
+
+**Flip both drain signals, not one.** They answer different clients: an
+orchestrator polls `/readyz` over HTTP, while a gRPC-native load balancer watches
+`grpc.health.v1.Health`. The health service starts at `SERVING` and nothing else
+moves it, so a hook that only touches readiness leaves gRPC callers routing here
+for the whole drain.
+
+```go
+lifecycle.BeforeShutdown(func() {
+    ready.Store(false)     // ops.WithReadyCheck sees this
+    rpc.SetServing(false)  // grpc.health.v1.Health/Check and /Watch see this
+}),
+```
+
+`TestSetServingFlipsGRPCHealth` covers it.
 
 Mounting handlers needs no import of `connectrpc` at all. A type satisfies
 `connectrpc.Module` structurally:
@@ -140,10 +169,23 @@ them:
   `read_timeout` deadline once the headers are read, so
   `read_header_timeout <= read_timeout` whenever the latter is on — otherwise the
   header phase outlives the whole-request budget and the body phase begins on an
-  expired deadline.
+  expired deadline. **`New` refuses that pair** rather than reordering it: the
+  ordinary way to arrive there is switching `read_timeout` on and leaving
+  `read_header_timeout` at its 10s default, which is a configuration saying
+  something its author did not mean.
+  `TestReadHeaderTimeoutMustFitReadTimeout` covers it — and caught this
+  package's own test writing exactly that pair.
 - **`max_concurrent_streams` bounds a connection, not a caller.** The default is
   the standard library's own current default, so it changes nothing until you
   lower it, and nothing here caps how many connections one peer may open.
+
+The `ops` server has a much smaller set — nothing there streams — but one of them
+is easy to leave off by accident. `ops.idle_timeout` is set explicitly, at the
+same 120s, because `net/http` falls back to `ReadTimeout` when `IdleTimeout` is
+zero and nothing on that port sets one: an unset field means **no idle timeout at
+all** rather than a conservative default. Every caller there — the metrics
+scraper, the orchestrator's probes — is a keep-alive client, so those are exactly
+the connections that would accumulate. `TestIdleTimeoutIsSetOnTheServer` pins it.
 
 `request_timeout` covers a handler that hangs while the connection is perfectly
 healthy: the peer answers PINGs, a stream is open so `idle_timeout` cannot fire,
@@ -275,7 +317,7 @@ in front of the database. That framing decides every setting here.
 | Setting | Fires when | Default |
 |---|---|---|
 | `max_open_conns` | connections in use and idle together reach the cap; further callers wait | 25 |
-| `max_idle_conns` | a connection is returned to an already-full idle set, and is closed | = `max_open_conns` |
+| `max_idle_conns` | a connection is returned to an already-full idle set, and is closed | = `max_open_conns`, and clamped to it |
 | `conn_max_lifetime` | a connection reaches this age and is retired | 30m |
 | `conn_max_idle_time` | a connection has gone unused for this long | 5m |
 | `connect_timeout` | a new connection takes too long to dial | 5s |
@@ -291,6 +333,12 @@ closes any connection returned to a full idle set, so a lower idle limit makes a
 service at its peak open and close connections continuously. Two metrics tell
 these apart — `wait.count` climbing means raise `max_open_conns`, whereas
 `closed{reason="idle"}` climbing means raise `max_idle_conns`.
+
+A value *above* `max_open_conns` is clamped down to it, because `database/sql`
+caps the idle set at the open limit whatever it was told. Left unclamped it is
+not a pool holding more idle connections, only a number that disagrees with the
+pool — and `db.client.connection.idle.max` would report it, since `database/sql`
+exposes no way to read the real limit back.
 
 `conn_max_lifetime` is what picks up a failover, a DNS change or a rolling
 restart of the database without restarting this process. Keep it below any
@@ -336,10 +384,20 @@ closure, and it is only called once the level is known to be enabled
 query promotes its statement to info, so debugging one query does not mean
 raising the level of the whole process.
 
-`caller` points at the repository that ran the query, not at this package. GORM
-calls the logger from inside its own callback chain, so the records are built by
-hand to resolve the frame below both GORM and this module
-(`TestCallerPointsAtTheCallingCode`).
+**`caller` on a statement line names this package, not the repository** — a
+limitation worth knowing rather than a feature. zerolog resolves a call site from a
+fixed stack depth, which is right for code that calls the logger directly; GORM
+calls this adapter from inside its own callback chain, so the frame at that depth
+is `database/logger.go` for every statement in the service.
+`TestStatementCallerNamesThisAdapter` pins it, and fails if it ever starts naming
+the repository, so the docs and the behaviour cannot drift apart.
+
+Resolving the repository's frame instead needs a stack search on every emitted
+statement, which costs more than everything else on the line, plus a package to
+hand the result to the logger. That was built and then removed: `log.caller` is off
+by default and statement lines are at debug, so it was paying a lot for a field
+almost nobody would see. If you need to know which code issued a query, the
+`statement` text already identifies it.
 
 ### Values stay out of logs and traces
 
@@ -565,6 +623,27 @@ code rather than user input. That is the opposite of `database`'s
 `include_query_values` stance, and it is worth remembering before writing a data
 migration with literal values in it.
 
+**Migration lines are messages, not fields.** goose offers two mutually exclusive
+logging options — `WithSlog`, which takes a `*slog.Logger` and emits attributes,
+and `WithLogger`, a `Printf`/`Fatalf` pair — and only the second can be satisfied
+by a `*zerolog.Logger`. goose renders a separate string for that path, so a line
+arrives as
+
+```json
+{"level":"info","message":"goose: OK 20260728000000_init.sql (1.1ms)"}
+```
+
+rather than with `source`, `direction`, `duration_seconds` and `state` as
+queryable fields. Nothing is lost from the account of what ran; it is just not
+filterable by field. `caller` on these lines names `migrate/logger.go`, since goose
+calls the adapter from its own code and there is no frame further out to find.
+
+One more consequence, confined to `lock_mode = "table"`: goose's
+`lock.WithTableLogger` also takes a `*slog.Logger` and has no other form, so the
+table locker is built without one and installs its own error-level text handler on
+stderr. A contended table lease therefore reports outside this service's stream and
+format. `lock_mode = "session"` is the default and has no logger at all.
+
 Versions are timestamps, not a counter. Two branches each adding "the next"
 sequential number merge cleanly and then collide at run time, where the collision
 is nobody's review comment.
@@ -591,33 +670,147 @@ something the module reaches for.
 That is why the RPC server can be used with no telemetry at all, and why
 `connectrpc-no-telemetry` in `.golangci.yml` forbids the shortcut.
 
-**`*slog.Logger` at the boundary.** No module exposes a back-end logger type, so
-consumers are not made to adopt one. `slog` is the front end; zerolog is the back
-end, via `zerolog.NewSlogHandler`, and that is an implementation detail of
-`telemetry.NewLogger` alone.
+**`*zerolog.Logger` at the boundary.** Every module takes one, and consumers
+therefore adopt zerolog. This is the one rule here that trades a principle for a
+number, and it is worth being explicit that it used to say the opposite: `slog` was
+the front end and zerolog the back end behind `zerolog.NewSlogHandler`, so no
+module exposed a back-end logger type.
+
+That arrangement kept zerolog's encoder and lost its performance, because the speed
+is in the chained API that `slog` replaces. Measured on the four-field `rpc` line,
+writing to `io.Discard`:
+
+| | before | after |
+|---|---|---|
+| a line that is emitted | 950 ns, 488 B, 5 allocs | **240 ns, 0 B, 0 allocs** |
+| a line from a `With()`-derived logger | 940 ns, 376 B, 5 allocs | **152 ns, 0 B, 0 allocs** |
+| a line dropped by the level | 16 ns, 0 allocs | 6.8 ns, 0 allocs |
+| an emitted line with `caller` | 950 ns, 488 B, 5 allocs | 880 ns, 312 B, 3 allocs |
+
+The last row is the like-for-like one, since `caller` used to be unconditional: the
+field itself was about 800 of the original 950ns and still dominates. Making it
+configurable is what the first row is really measuring.
+
+`slog` cost about 340ns and one allocation per line; the rest went with
+`CorrelationHandler`, which copied every record — it allocated a fresh attribute
+slice and a second `slog.Record` so it could keep `trace_id` outside any open
+group. zerolog has no groups, so that machinery is gone rather than ported.
+`pkg/telemetry/logger_bench_test.go` is the benchmark.
+
+Two things that were expected to matter did not. Dropped lines were already free:
+Go stack-allocates the variadic `...any` slice when it does not escape, so
+`log.Debug("msg", "k", v)` at a disabled level allocated nothing before either.
+And `slog.JSONHandler` preformats `With()` attributes while zerolog's slog handler
+re-encodes them per record, so on that axis the bridge was worse than the standard
+library it was wrapping.
 
 ## Logging specifics
 
-Fields follow **zerolog's** names, not slog's: `level`, `message`, `time`.
-Renaming them means assigning to zerolog's package-level variables
-(`zerolog.MessageFieldName` and friends), which would reach into every other use
-of zerolog in the importing process, so they are left alone.
+Fields are named `level`, `message`, `time` — zerolog's own. Renaming them means
+assigning to zerolog's package-level variables (`zerolog.MessageFieldName` and
+friends), which would reach into every other use of zerolog in the importing
+process, so they are left alone. The same rule is why `caller` is formatted here
+rather than through `zerolog.CallerMarshalFunc`, which is also a global and would
+otherwise report an absolute build-machine path.
 
-`log.level` is a **zerolog** level name — `trace`, `debug`, `info`, `warn`,
-`error`, `fatal`, `panic`. An unknown name is a startup error.
+`log.level` is a zerolog level name — `trace`, `debug`, `info`, `warn`, `error`,
+`fatal`, `panic`. An unknown name is a startup error.
 
-Groups **flatten to dotted keys** (`logger.WithGroup("req")` yields `req.path`),
-which is zerolog's convention rather than slog's nested objects.
-`trace_id`, `span_id` and `caller` stay at the top level regardless of any open
-group — that is the whole reason `CorrelationHandler` replays groups itself
-instead of pushing them into the back end.
+`telemetry.NewLogger` adds `Timestamp()` explicitly, because `zerolog.New`
+installs no timestamp hook and a record would otherwise carry no `time` at all.
 
-`caller` exists because zerolog's slog handler ignores `Record.PC` entirely.
-`CorrelationHandler` resolves the program counter slog captured at the call site,
-so the frame points at your code rather than at the logging plumbing.
+### `log.caller` is off by default
 
-`telemetry.NewLogger` installs its logger as the `slog` default, which also
-routes the standard library's `log` package through it.
+It is zerolog's own caller hook, switched on by configuration:
+
+```toml
+[log]
+caller = false   # file:line on every record
+```
+
+Off, for two reasons. It is the most expensive thing on a log line — 240ns becomes
+880ns on the four-field `rpc` line, and three allocations appear where there were
+none. And it earns very little here: every message this repository emits is already
+unique to one call site, and the per-RPC lines carry `procedure`, which identifies
+the code better than a file:line does. The place it would earn most —
+`database`'s `sql` lines, where one message covers every repository — is the one
+place it cannot deliver; see [Statements](#statements-and-the-level-they-land-at).
+
+The value is **zerolog's format: the full path recorded at build time**, e.g.
+`/src/pkg/ops/server.go:112`, or whatever `-trimpath` left behind. Shortening it
+means assigning to `zerolog.CallerMarshalFunc`, a package-level variable, for the
+same reason the field names are left alone.
+
+Resolution belongs to zerolog rather than to `correlationHook`, and that is a
+deliberate reversal of an earlier attempt. `slog` used to capture the call site's
+program counter for free inside `Logger.log`; a `zerolog.Hook` is handed nothing, so
+a hook that wants the frame has to search the stack for it — which measured 2.3µs
+against zerolog's 880ns, and was fragile, because the distance from a hook to the
+call site varies with which terminator was used and with what the compiler inlined.
+zerolog resolves from a fixed depth that `Msg`, `Msgf`, `Send` and `MsgFunc` all
+share, and being a library it is the right place for that constant to live.
+
+### The standard library's `log` package
+
+`telemetry.NewLogger` points `log.SetOutput` at the logger, which satisfies
+`io.Writer`, so a dependency logging through the standard library lands in the same
+stream. It replaces the `slog.SetDefault` that used to do this.
+
+Those lines carry **no `level` field**: `zerolog.Logger.Write` emits a level-less
+event. Worth knowing before filtering a stream on `level`.
+`TestNewLoggerRoutesTheStandardLibrary` pins both halves.
+
+### OTel's own errors
+
+OpenTelemetry reports its own failures — a span export that was refused, a flush
+that timed out — through `otel.Handle`, and with no handler installed that falls
+through to the package-level `log.Print`. Combined with the section above, an
+export failure therefore arrives in the stream with **no level** and a `caller`
+naming Go's `log/log.go`, which no filter can select and no reader can act on.
+
+`telemetry.Setup` takes `telemetry.WithErrorLogger(log)` to fix that half:
+
+```go
+tel, err := telemetry.Setup(ctx, cfg.Otel, telemetry.WithErrorLogger(log))
+```
+
+which turns the same event into a selectable line:
+
+```json
+{"level":"warn","error":"traces export: ... connect: connection refused","message":"otel"}
+```
+
+**Warn, not error, deliberately.** Every `otel.Handle` call site in the trace SDK
+is an export, a flush or a shutdown, so what it reports is telemetry being lost,
+never a request failing — and it is unbounded, since the batch processor calls it
+once per failed export for as long as a collector outage lasts. At error level a
+collector being down pages an on-call rotation for something it cannot act on.
+
+Two limitations survive the option, both because `otel.ErrorHandler` is
+`Handle(error)` and nothing more:
+
+- **No `trace_id`.** There is no context to read a span from.
+- **`caller` names the handler** (`pkg/telemetry/telemetry.go`) when `log.caller`
+  is on. It is the same value for every OTel error, so it identifies nothing.
+
+Also note OTel delegates to a handler only on the **first** `SetErrorHandler`
+call. An application installing its own as well gets one of the two depending on
+order, with no error either way.
+
+Separately, OTel's *non-error* self-reporting (`global.Info`/`Warn`/`Debug` — span
+attribute limits, dropped queue entries) goes through a `logr` sink backed by its
+own `log.New(os.Stderr, …)`, a fresh logger rather than the standard one. Those
+bypass `log.SetOutput` entirely and reach stderr unstructured. Closing that needs
+a `logr.LogSink` adapter passed to `otel.SetLogger`, which is not done here.
+
+### Groups are gone
+
+There is no `WithGroup`, because zerolog has no groups. Records were previously
+flattened to dotted keys (`logger.WithGroup("req")` yielding `req.path`), and
+`CorrelationHandler` existed largely to replay those groups itself so that
+`trace_id` and `span_id` could not end up nested inside one. Nothing can swallow
+them now, so that machinery is deleted rather than reimplemented. Nest with a key
+prefix if you want the effect.
 
 There are two per-request lines, and which one you get says where the request
 died:
@@ -625,7 +818,7 @@ died:
 | Line | Means |
 |---|---|
 | `rpc` | it reached a handler; carries `code`, `duration`, `trace_id` |
-| `rpc rejected` | it never became an RPC; carries `procedure`, `peer`, `duration`, `proto` |
+| `rpc rejected` | it never became an RPC; carries `procedure`, `peer`, `duration`, `proto`, `method` |
 
 `rpc rejected` exists because no interceptor can see that class of failure.
 Connect decodes the request message *before* the interceptor chain runs, so a
@@ -656,9 +849,40 @@ chain has returned, through an unexported helper. Using it directly would log
 every client disconnect and every timeout as `unknown` while the caller
 correctly received `canceled` or `deadline_exceeded`.
 
+### Two otelconnect defaults that are not left alone
+
+`otelconnect` is what produces the RPC spans and metrics, and two of its defaults
+do not survive contact with a long-running service.
+
+**Peer attributes are switched off.** Left on, `net.peer.name` and
+`net.peer.port` go onto every server span *and* onto the five metrics
+otelconnect records per RPC. The peer port is a fresh ephemeral number per
+connection, so each one mints a new attribute set — and the Prometheus reader is
+pull-based, so the SDK retains every set it has ever seen. That is an unbounded
+`/metrics` body and unbounded memory, produced by ordinary traffic rather than by
+anything going wrong. otelconnect's own documentation calls the default "very
+high-cardinality", and ships `WithoutServerPeerAttributes` for it. The peer is
+still on the `rpc` log line, which is where it was useful anyway.
+
+**An incoming trace is not trusted by default.** otelconnect reads the caller's
+trace context and then starts a *new root span linked to it* rather than a child,
+so a distributed trace breaks at every hop and this service's `trace_id` is not
+the one the caller saw. That is the right default at the edge — a trace id
+arrives in a header, so an untrusted peer can choose it, joining its requests
+onto a trace of its choosing or inflating one without bound — and the wrong one
+behind a mesh. It is opt-in rather than a changed default:
+
+```go
+connectrpc.New(cfg, connectrpc.WithTrustRemoteSpans())   // peers inside the trust boundary
+```
+
+A service that is reachable both ways wants it off, and the trace joined by the
+internal hop behind it instead.
+
 Correlation is read from the context, so it only works if you pass one. Use
-`log.InfoContext(ctx, ...)` or `log.LogAttrs(ctx, ...)`; plain `log.Info(...)`
-produces a line with no `trace_id`. For the same reason the otel interceptor is
+`log.Info().Ctx(ctx)`; plain `log.Info()` produces a line with no `trace_id`,
+because `Event.GetCtx` is the only way the hook can reach one. For the same
+reason the otel interceptor is
 registered ahead of the logging one inside `connectrpc.New` — Connect makes the
 first interceptor outermost, so the reverse order would leave every RPC log line
 uncorrelated. `TestRPCLogLineSeesSpanContext` exists to keep that from

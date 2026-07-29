@@ -11,7 +11,8 @@ package db
 import (
 	"context"
 	"errors"
-	"log/slog"
+
+	"github.com/rs/zerolog"
 
 	"github.com/koungkub/tehran/internal/config"
 	"github.com/koungkub/tehran/internal/migrations"
@@ -36,7 +37,7 @@ const poolConns = 2
 
 // App is the wired-up db command: a pool and the migrator over it.
 type App struct {
-	log      *slog.Logger
+	log      *zerolog.Logger
 	pool     *database.DB
 	migrator *migrate.Migrator
 }

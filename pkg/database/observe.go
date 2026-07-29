@@ -170,6 +170,14 @@ func (i *instrumentation) before(operation string) func(*gorm.DB) {
 func (i *instrumentation) after(fallback string) func(*gorm.DB) {
 	return func(tx *gorm.DB) {
 		ctx := tx.Statement.Context
+		if ctx == nil {
+			// The same guard before() carries. It cannot be reached from here —
+			// before() replaces a nil context with one carrying the state this
+			// reads — but the two callbacks disagreeing about whether the field can
+			// be nil is worse than the guard: one of them would be wrong, and this
+			// is the one that would panic inside a GORM callback chain.
+			return
+		}
 		state, ok := ctx.Value(stateKey{}).(*spanState)
 		if !ok {
 			return // Not a statement this package started a span for.

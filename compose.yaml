@@ -1,0 +1,50 @@
+# Local development database. Not a production artifact: the password is in the
+# file on purpose, and the port is bound to loopback so nothing on the LAN can
+# reach it. `docker compose up -d` is the whole setup step.
+#
+# Credentials match config.toml ([database].user/database = "tehran"), so the
+# only thing the binary still needs from the environment is the password:
+#
+#   TEHRAN_DATABASE_PASSWORD=tehran ./bin/tehran db migrate --config config.toml
+
+services:
+  db:
+    image: postgres:18
+    container_name: tehran-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: tehran
+      POSTGRES_PASSWORD: tehran
+      POSTGRES_DB: tehran
+      # Checksums cost a few percent and turn silent corruption in a laptop's
+      # page cache into an error. initdb only reads this on first start.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    ports:
+      # Loopback-only. "5432:5432" would publish the database on every
+      # interface, which on a shared network is a database anyone can open.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      # Postgres 18's image moved PGDATA to /var/lib/postgresql/18/docker and
+      # declares VOLUME /var/lib/postgresql. Mounting the old
+      # /var/lib/postgresql/data path here would leave the real data directory
+      # inside the container's writable layer, to be lost on the next `down`.
+      - pgdata:/var/lib/postgresql
+    # Parallel query and large sorts use shared memory; the 64MB a container
+    # gets by default produces "could not resize shared memory segment".
+    shm_size: 256mb
+    command:
+      # Mirrors database.slow_query_threshold = "200ms" in config.toml, so a
+      # statement the service logs as slow is also logged server-side.
+      - "-c"
+      - "log_min_duration_statement=200"
+    healthcheck:
+      # -U/-d matter: bare pg_isready reports ready while initdb is still
+      # running its bootstrap pass on first boot.
+      test: ["CMD-SHELL", "pg_isready -U tehran -d tehran"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  pgdata:

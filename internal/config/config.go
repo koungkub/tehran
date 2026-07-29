@@ -92,6 +92,7 @@ func Load(configFile string, flags *pflag.FlagSet) (*Config, error) {
 	v.SetDefault("ops.port", 9090)
 	v.SetDefault("ops.shutdown_timeout", ops.DefaultShutdownTimeout)
 	v.SetDefault("ops.read_header_timeout", ops.DefaultReadHeaderTimeout)
+	v.SetDefault("ops.idle_timeout", ops.DefaultIdleTimeout)
 	// The database section is off until a domain here persists something, but
 	// every key still needs registering: an unregistered key cannot be set from
 	// the environment at all, and the credentials are exactly what arrives that

@@ -10,17 +10,18 @@ package greeter
 
 import (
 	"context"
-	"log/slog"
+
+	"github.com/rs/zerolog"
 )
 
 // Service is the greeter domain logic. It has no knowledge of transports
 // (ConnectRPC, message consumers, …); adapters translate to and from it.
 type Service struct {
-	log *slog.Logger
+	log *zerolog.Logger
 }
 
 // NewService builds the greeter domain service.
-func NewService(log *slog.Logger) *Service {
+func NewService(log *zerolog.Logger) *Service {
 	return &Service{log: log}
 }
 

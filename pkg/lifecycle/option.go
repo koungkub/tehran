@@ -1,9 +1,11 @@
 package lifecycle
 
 import (
-	"log/slog"
 	"os"
 	"syscall"
+
+	"github.com/rs/zerolog"
+	zlog "github.com/rs/zerolog/log"
 )
 
 // Option configures a Supervisor. The set is closed: only this package can
@@ -11,7 +13,7 @@ import (
 type Option func(*options)
 
 type options struct {
-	log            *slog.Logger
+	log            *zerolog.Logger
 	components     []Component
 	beforeShutdown []func()
 	signals        []os.Signal
@@ -19,7 +21,7 @@ type options struct {
 
 func newOptions(opts []Option) options {
 	o := options{
-		log: slog.Default(),
+		log: &zlog.Logger,
 		// Handling termination signals is the common case, so it is the default;
 		// WithSignals with no arguments opts out.
 		signals: []os.Signal{syscall.SIGINT, syscall.SIGTERM},
@@ -30,9 +32,9 @@ func newOptions(opts []Option) options {
 	return o
 }
 
-// WithLogger sets the logger used for lifecycle events. Defaults to
-// slog.Default().
-func WithLogger(log *slog.Logger) Option {
+// WithLogger sets the logger used for lifecycle events. Defaults to zerolog's
+// package-level logger.
+func WithLogger(log *zerolog.Logger) Option {
 	return func(o *options) {
 		if log != nil {
 			o.log = log
@@ -54,8 +56,11 @@ func WithComponents(components ...Component) Option {
 // open at that point, so a load balancer can observe the instance leaving
 // service before anything stops accepting connections.
 //
-// Hooks run in registration order, on the goroutine that called Run, so they
-// must not block for long.
+// Hooks run in registration order, on the goroutine that called Run, and they
+// spend Config.ShutdownTimeout: the clock starts before the first one, so
+// whatever they take is taken from the components' drain. Being on Run's
+// goroutine, a hook that never returns is not preempted by that timeout either —
+// it stops the shutdown where it stands. Keep them to setting a flag.
 func BeforeShutdown(hooks ...func()) Option {
 	return func(o *options) {
 		for _, h := range hooks {

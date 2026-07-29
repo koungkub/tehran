@@ -4,22 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
-	"path"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
+	"github.com/rs/zerolog"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 )
 
-// gormLogger adapts GORM's logger interface onto *slog.Logger, so a service gets
-// its statements in the same stream, format and correlation as everything else
-// it logs, and this package exposes no logging type of its own.
+// gormLogger adapts GORM's logger interface onto *zerolog.Logger, so a service
+// gets its statements in the same stream, format and correlation as everything
+// else it logs, and this package exposes no logging type of its own.
 type gormLogger struct {
-	log           *slog.Logger
+	log           *zerolog.Logger
 	slowThreshold time.Duration
 	includeValues bool
 	// verbose logs every statement at info rather than debug. It is set by
@@ -30,7 +27,7 @@ type gormLogger struct {
 	silent  bool
 }
 
-func newLogger(log *slog.Logger, cfg Config) gormlogger.Interface {
+func newLogger(log *zerolog.Logger, cfg Config) gormlogger.Interface {
 	return gormLogger{
 		log:           log,
 		slowThreshold: cfg.SlowQueryThreshold,
@@ -50,15 +47,15 @@ func (l gormLogger) LogMode(level gormlogger.LogLevel) gormlogger.Interface {
 // dialector that cannot translate errors — not statements.
 
 func (l gormLogger) Info(ctx context.Context, msg string, args ...any) {
-	l.emit(ctx, slog.LevelInfo, message(msg, args))
+	l.emit(ctx, zerolog.InfoLevel, message(msg, args))
 }
 
 func (l gormLogger) Warn(ctx context.Context, msg string, args ...any) {
-	l.emit(ctx, slog.LevelWarn, message(msg, args))
+	l.emit(ctx, zerolog.WarnLevel, message(msg, args))
 }
 
 func (l gormLogger) Error(ctx context.Context, msg string, args ...any) {
-	l.emit(ctx, slog.LevelError, message(msg, args))
+	l.emit(ctx, zerolog.ErrorLevel, message(msg, args))
 }
 
 // message renders what GORM passed, which is a printf format string and its
@@ -86,7 +83,7 @@ func (l gormLogger) Trace(ctx context.Context, begin time.Time, fc func() (strin
 		return
 	}
 	elapsed := time.Since(begin)
-	level, msg := slog.LevelDebug, "sql"
+	level, msg := zerolog.DebugLevel, "sql"
 	switch {
 	case errors.Is(err, gorm.ErrRecordNotFound):
 		// The documented result of First on an empty set. A repository decides
@@ -95,41 +92,43 @@ func (l gormLogger) Trace(ctx context.Context, begin time.Time, fc func() (strin
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		// The caller went away or ran out of time. Nothing is wrong with the
 		// database, but a rise in these is worth seeing.
-		level, msg = slog.LevelWarn, "sql aborted"
+		level, msg = zerolog.WarnLevel, "sql aborted"
 	case err != nil:
-		level, msg = slog.LevelError, "sql failed"
+		level, msg = zerolog.ErrorLevel, "sql failed"
 	case l.slowThreshold > 0 && elapsed > l.slowThreshold:
-		level, msg = slog.LevelWarn, "sql slow"
+		level, msg = zerolog.WarnLevel, "sql slow"
 	}
 	// db.Debug() asked for this statement specifically, so raise it to a level a
 	// production logger has enabled — including the not-found case, where "the row
 	// is not there" is often the very thing being debugged.
-	if l.verbose && level < slog.LevelInfo {
-		level = slog.LevelInfo
+	if l.verbose && level < zerolog.InfoLevel {
+		level = zerolog.InfoLevel
 	}
 
 	// fc builds the statement text and counts the rows, which is not free, so
-	// check the level is actually enabled before calling it. This is the whole
-	// reason statements cost nothing at the default level.
-	if !l.log.Enabled(ctx, level) {
+	// check the level is actually enabled before calling it. WithLevel returns a
+	// disabled event rather than nil when the level is off, and Enabled reports
+	// which — this is the whole reason statements cost nothing at the default
+	// level.
+	e := l.log.WithLevel(level)
+	if !e.Enabled() {
 		return
 	}
 	statement, rows := fc()
-	attrs := []slog.Attr{
-		slog.String("statement", statement),
+	e.Ctx(ctx).
+		Str("statement", statement).
 		// The elapsed time measured above, not a second reading: the level was
 		// decided from the first one, and a line whose duration disagrees with
 		// the threshold that classified it is worse than useless.
-		slog.Duration("duration", elapsed),
-	}
+		Dur("duration", elapsed)
 	// GORM reports -1 for a statement whose row count is not meaningful.
 	if rows != -1 {
-		attrs = append(attrs, slog.Int64("rows", rows))
+		e.Int64("rows", rows)
 	}
 	if err != nil {
-		attrs = append(attrs, slog.String("error", err.Error()))
+		e.Str("error", err.Error())
 	}
-	l.emit(ctx, level, msg, attrs...)
+	e.Msg(msg)
 }
 
 // ParamsFilter is GORM's hook for deciding what a statement's bound values look
@@ -142,58 +141,14 @@ func (l gormLogger) ParamsFilter(_ context.Context, sql string, params ...any) (
 	return sql, nil
 }
 
-// emit builds the record by hand for one reason: Record.PC. A record created
-// through slog.Logger's own methods would carry a call site inside this file, so
-// every statement in the service would report the same one.
-func (l gormLogger) emit(ctx context.Context, level slog.Level, msg string, attrs ...slog.Attr) {
-	if l.silent || !l.log.Enabled(ctx, level) {
+// emit is the plain path for GORM's own messages, which carry no fields.
+func (l gormLogger) emit(ctx context.Context, level zerolog.Level, msg string) {
+	if l.silent {
 		return
 	}
-	r := slog.NewRecord(time.Now(), level, msg, callerPC())
-	r.AddAttrs(attrs...)
-	// Handle rather than one of slog.Logger's methods, which would build a
-	// second record and discard the call site resolved above. Attributes added
-	// with logger.With are held by the handler, so they survive this.
-	_ = l.log.Handler().Handle(ctx, r)
-}
-
-// thisDir is this file's directory at compile time, used to recognise this
-// package's own frames.
-var thisDir = func() string {
-	_, file, _, _ := runtime.Caller(0)
-	return path.Dir(filepath.ToSlash(file)) + "/"
-}()
-
-// callerPC resolves the program counter of the code that ran the statement,
-// which is the frame below both this package and GORM itself — a repository
-// method, typically. GORM's own utils.CallerFrame stops at the first frame
-// outside GORM, which from here would be this file.
-//
-// It returns 0 when no such frame is found, which slog treats as "no source
-// information" rather than as an error.
-func callerPC() uintptr {
-	var pcs [16]uintptr
-	// Skip runtime.Callers, callerPC and emit.
-	n := runtime.Callers(4, pcs[:])
-	frames := runtime.CallersFrames(pcs[:n])
-	for {
-		frame, more := frames.Next()
-		if frame.PC == 0 {
-			return 0
-		}
-		file := filepath.ToSlash(frame.File)
-		// A test in this package is a caller like any other, so it is exempt
-		// from the rule that skips this package's own frames — the same
-		// exception GORM makes in its own caller resolution, and the only way
-		// this behaviour can be asserted from here at all.
-		switch {
-		case strings.HasSuffix(file, "_test.go"):
-			return frame.PC
-		case !strings.HasPrefix(file, thisDir) && !strings.Contains(file, "/gorm.io/"):
-			return frame.PC
-		}
-		if !more {
-			return 0
-		}
+	e := l.log.WithLevel(level)
+	if !e.Enabled() {
+		return
 	}
+	e.Ctx(ctx).Msg(msg)
 }

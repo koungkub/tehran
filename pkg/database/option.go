@@ -1,8 +1,8 @@
 package database
 
 import (
-	"log/slog"
-
+	"github.com/rs/zerolog"
+	zlog "github.com/rs/zerolog/log"
 	"go.opentelemetry.io/otel/metric"
 	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	"go.opentelemetry.io/otel/trace"
@@ -15,7 +15,7 @@ type Option func(*options)
 
 type options struct {
 	name           string
-	log            *slog.Logger
+	log            *zerolog.Logger
 	dialector      gorm.Dialector
 	plugins        []gorm.Plugin
 	tracerProvider trace.TracerProvider
@@ -24,11 +24,11 @@ type options struct {
 
 func newOptions(opts []Option) options {
 	// Defaults keep Open usable with no options at all: logging goes wherever
-	// slog's default handler points, and the no-op providers make the
+	// zerolog's package-level logger points, and the no-op providers make the
 	// instrumentation inert rather than absent.
 	o := options{
 		name:           DefaultName,
-		log:            slog.Default(),
+		log:            &zlog.Logger,
 		tracerProvider: tracenoop.NewTracerProvider(),
 		meterProvider:  metricnoop.NewMeterProvider(),
 	}
@@ -50,12 +50,12 @@ func WithName(name string) Option {
 }
 
 // WithLogger sets the logger for statements, slow queries and connection
-// events. Defaults to slog.Default().
+// events. Defaults to zerolog's package-level logger.
 //
 // Statement lines carry the trace of the request that caused them only if the
 // query ran with a context — gorm.WithContext(ctx) — since that is where the
 // span comes from.
-func WithLogger(log *slog.Logger) Option {
+func WithLogger(log *zerolog.Logger) Option {
 	return func(o *options) {
 		if log != nil {
 			o.log = log

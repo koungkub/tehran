@@ -1,6 +1,7 @@
 .git
 bin/
 Dockerfile
+compose.yaml
 .dockerignore
 *.md
 .gitignore

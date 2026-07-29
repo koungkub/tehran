@@ -1,7 +1,8 @@
 package connectrpc
 
 import (
-	"log/slog"
+	"github.com/rs/zerolog"
+	zlog "github.com/rs/zerolog/log"
 
 	"connectrpc.com/connect"
 	"go.opentelemetry.io/otel/metric"
@@ -15,21 +16,22 @@ import (
 type Option func(*options)
 
 type options struct {
-	name           string
-	log            *slog.Logger
-	modules        []Module
-	interceptors   []connect.Interceptor
-	tracerProvider trace.TracerProvider
-	meterProvider  metric.MeterProvider
+	name             string
+	log              *zerolog.Logger
+	modules          []Module
+	interceptors     []connect.Interceptor
+	tracerProvider   trace.TracerProvider
+	meterProvider    metric.MeterProvider
+	trustRemoteSpans bool
 }
 
 func newOptions(opts []Option) options {
 	// Defaults keep New usable with no options at all: logging goes wherever
-	// slog's default handler points, and the no-op providers make the otel
+	// zerolog's package-level logger points, and the no-op providers make the otel
 	// interceptor inert rather than absent.
 	o := options{
 		name:           DefaultName,
-		log:            slog.Default(),
+		log:            &zlog.Logger,
 		tracerProvider: tracenoop.NewTracerProvider(),
 		meterProvider:  metricnoop.NewMeterProvider(),
 	}
@@ -51,8 +53,8 @@ func WithName(name string) Option {
 }
 
 // WithLogger sets the logger used for the per-RPC log line, panics, and
-// lifecycle events. Defaults to slog.Default().
-func WithLogger(log *slog.Logger) Option {
+// lifecycle events. Defaults to zerolog's package-level logger.
+func WithLogger(log *zerolog.Logger) Option {
 	return func(o *options) {
 		if log != nil {
 			o.log = log
@@ -90,4 +92,23 @@ func WithMeterProvider(mp metric.MeterProvider) Option {
 			o.meterProvider = mp
 		}
 	}
+}
+
+// WithTrustRemoteSpans makes an incoming traceparent the *parent* of this
+// server's span, so one trace runs across the services that handled a request.
+//
+// Without it a caller's trace context is still read, but otelconnect starts a
+// new root span and merely links to it — which means a distributed trace breaks
+// at every hop, and the trace_id on this service's log lines is not the one the
+// caller saw. That is otelconnect's default, and it is the right default for a
+// server reachable by callers it does not control: a trace id arrives in a
+// header, so an untrusted peer can choose it, joining its requests onto a trace
+// of its choosing or inflating one without bound.
+//
+// Turn it on for a service whose peers are inside the same trust boundary — a
+// mesh, a private network, an authenticated internal API — and leave it off at
+// the edge. A service that does both wants it off, and the trace joined by the
+// internal hop behind it instead.
+func WithTrustRemoteSpans() Option {
+	return func(o *options) { o.trustRemoteSpans = true }
 }

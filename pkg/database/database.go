@@ -17,7 +17,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log/slog"
 	"math"
 	"net"
 	"net/url"
@@ -26,6 +25,7 @@ import (
 	"time"
 
 	mysqldriver "github.com/go-sql-driver/mysql"
+	"github.com/rs/zerolog"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -147,6 +147,14 @@ func (c Config) withDefaults() Config {
 		c.MaxOpenConns = DefaultMaxOpenConns
 	}
 	if c.MaxIdleConns <= 0 {
+		c.MaxIdleConns = c.MaxOpenConns
+	}
+	// database/sql caps the idle set at MaxOpenConns whatever it was told, so a
+	// larger value here is not a pool that keeps more connections idle — it is
+	// only a number that disagrees with the pool. Clamping it keeps
+	// db.client.connection.idle.max reporting the limit actually in force, since
+	// database/sql exposes no way to read it back.
+	if c.MaxIdleConns > c.MaxOpenConns {
 		c.MaxIdleConns = c.MaxOpenConns
 	}
 	if c.ConnMaxLifetime <= 0 {
@@ -282,7 +290,7 @@ func dialectorFor(driver, dsn string) (gorm.Dialector, error) {
 type DB struct {
 	gorm   *gorm.DB
 	sql    *sql.DB
-	log    *slog.Logger
+	log    *zerolog.Logger
 	name   string
 	target string
 	// pingTimeout bounds a Ping whose caller supplied no deadline. See Ping.
@@ -365,11 +373,11 @@ func Open(ctx context.Context, cfg Config, opts ...Option) (*DB, error) {
 		return nil, errors.Join(err, db.Close())
 	}
 
-	o.log.LogAttrs(ctx, slog.LevelInfo, db.name+" connected",
-		slog.String("target", db.target),
-		slog.Int("max_open_conns", cfg.MaxOpenConns),
-		slog.Duration("conn_max_lifetime", cfg.ConnMaxLifetime),
-	)
+	o.log.Info().Ctx(ctx).
+		Str("target", db.target).
+		Int("max_open_conns", cfg.MaxOpenConns).
+		Dur("conn_max_lifetime", cfg.ConnMaxLifetime).
+		Msg(db.name + " connected")
 	return db, nil
 }
 

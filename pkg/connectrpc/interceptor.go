@@ -3,24 +3,24 @@ package connectrpc
 import (
 	"context"
 	"errors"
-	"log/slog"
 	"net/http"
 	"os"
 	"runtime/debug"
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/rs/zerolog"
 )
 
 // loggingInterceptor emits one log line per RPC: procedure, peer, duration and
 // connect code.
 type loggingInterceptor struct {
-	log *slog.Logger
+	log *zerolog.Logger
 }
 
 var _ connect.Interceptor = (*loggingInterceptor)(nil)
 
-func newLoggingInterceptor(log *slog.Logger) *loggingInterceptor {
+func newLoggingInterceptor(log *zerolog.Logger) *loggingInterceptor {
 	return &loggingInterceptor{log: log}
 }
 
@@ -58,20 +58,22 @@ func (i *loggingInterceptor) logResult(
 	// not report it a second time as a rejection.
 	markAccounted(ctx)
 
-	attrs := []slog.Attr{
-		slog.String("procedure", procedure),
-		slog.String("peer", peer),
-		slog.Duration("duration", duration),
-	}
+	// One event, whichever way this went: the level is chosen first because
+	// creating a second one would emit a second line.
+	e := i.log.Info()
 	if err != nil {
-		attrs = append(attrs,
-			slog.String("code", codeOf(err).String()),
-			slog.String("error", err.Error()),
-		)
-		i.log.LogAttrs(ctx, slog.LevelWarn, "rpc", attrs...)
-		return
+		e = i.log.Warn()
 	}
-	i.log.LogAttrs(ctx, slog.LevelInfo, "rpc", append(attrs, slog.String("code", "ok"))...)
+	e.Ctx(ctx).
+		Str("procedure", procedure).
+		Str("peer", peer).
+		Dur("duration", duration)
+	if err != nil {
+		e.Str("code", codeOf(err).String()).Str("error", err.Error())
+	} else {
+		e.Str("code", "ok")
+	}
+	e.Msg("rpc")
 }
 
 // codeOf classifies an RPC error the way Connect's protocol layer eventually
@@ -146,13 +148,13 @@ func (i *timeoutInterceptor) WrapStreamingHandler(next connect.StreamingHandlerF
 
 // newRecoverHandler turns a panicking RPC into CodeInternal instead of killing
 // the process, logging the panic value and stack.
-func newRecoverHandler(log *slog.Logger) func(context.Context, connect.Spec, http.Header, any) error {
+func newRecoverHandler(log *zerolog.Logger) func(context.Context, connect.Spec, http.Header, any) error {
 	return func(ctx context.Context, spec connect.Spec, _ http.Header, recovered any) error {
-		log.LogAttrs(ctx, slog.LevelError, "rpc panic",
-			slog.String("procedure", spec.Procedure),
-			slog.Any("panic", recovered),
-			slog.String("stack", string(debug.Stack())),
-		)
+		log.Error().Ctx(ctx).
+			Str("procedure", spec.Procedure).
+			Interface("panic", recovered).
+			Str("stack", string(debug.Stack())).
+			Msg("rpc panic")
 		return connect.NewError(connect.CodeInternal, errors.New("internal server error"))
 	}
 }

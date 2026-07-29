@@ -2,10 +2,11 @@ package connectrpc
 
 import (
 	"context"
-	"log/slog"
 	"net/http"
 	"sync/atomic"
 	"time"
+
+	"github.com/rs/zerolog"
 )
 
 // accountedKey carries a flag saying this request has been accounted for, so the
@@ -49,7 +50,7 @@ func accountedFor(h http.Handler) http.Handler {
 // with a direct type assertion rather than through http.ResponseController, so a
 // wrapper that did not reimplement Flush would break every streaming RPC. The
 // path, peer and duration are enough to see the traffic.
-func newRejectionLogger(next http.Handler, log *slog.Logger) http.Handler {
+func newRejectionLogger(next http.Handler, log *zerolog.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var accounted atomic.Bool
 		ctx := context.WithValue(r.Context(), accountedKey{}, &accounted)
@@ -60,12 +61,12 @@ func newRejectionLogger(next http.Handler, log *slog.Logger) http.Handler {
 			return // Already on the rpc log line, with a code and a trace id.
 		}
 
-		log.LogAttrs(ctx, slog.LevelWarn, "rpc rejected",
-			slog.String("procedure", r.URL.Path),
-			slog.String("peer", r.RemoteAddr),
-			slog.Duration("duration", time.Since(start)),
-			slog.String("proto", r.Proto),
-			slog.String("method", r.Method),
-		)
+		log.Warn().Ctx(ctx).
+			Str("procedure", r.URL.Path).
+			Str("peer", r.RemoteAddr).
+			Dur("duration", time.Since(start)).
+			Str("proto", r.Proto).
+			Str("method", r.Method).
+			Msg("rpc rejected")
 	})
 }

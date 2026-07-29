@@ -11,19 +11,24 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/rs/zerolog"
 )
 
 // Defaults substituted by New for zero-valued Config fields.
 const (
 	DefaultReadHeaderTimeout = 10 * time.Second
 	DefaultShutdownTimeout   = 5 * time.Second
+	// DefaultIdleTimeout matches pkg/connectrpc's. Everything that talks to this
+	// port — a Prometheus scraper, an orchestrator's probes — reconnects on a
+	// schedule and keeps its connections alive between polls, so without a bound
+	// a peer that goes away without a FIN leaves one behind for good.
+	DefaultIdleTimeout = 120 * time.Second
 )
 
 // DefaultName labels the server in logs and to a supervisor.
@@ -39,6 +44,14 @@ type Config struct {
 	// is long-running.
 	ShutdownTimeout   time.Duration `mapstructure:"shutdown_timeout"`
 	ReadHeaderTimeout time.Duration `mapstructure:"read_header_timeout"`
+	// IdleTimeout reaps a kept-alive connection with no request in flight.
+	//
+	// It has to be set explicitly: net/http falls back to ReadTimeout when this
+	// is zero, and nothing here sets one, so leaving it out means no idle timeout
+	// at all rather than a conservative one. Scrapers and probes are the only
+	// callers and they are all keep-alive clients, so the connections that leak
+	// that way are exactly the ones this port collects.
+	IdleTimeout time.Duration `mapstructure:"idle_timeout"`
 }
 
 func (c Config) withDefaults() Config {
@@ -48,6 +61,9 @@ func (c Config) withDefaults() Config {
 	if c.ReadHeaderTimeout <= 0 {
 		c.ReadHeaderTimeout = DefaultReadHeaderTimeout
 	}
+	if c.IdleTimeout <= 0 {
+		c.IdleTimeout = DefaultIdleTimeout
+	}
 	return c
 }
 
@@ -56,7 +72,7 @@ func (c Config) withDefaults() Config {
 // components without this package importing one.
 type Server struct {
 	http            *http.Server
-	log             *slog.Logger
+	log             *zerolog.Logger
 	name            string
 	shutdownTimeout time.Duration
 }
@@ -95,6 +111,7 @@ func New(cfg Config, opts ...Option) *Server {
 			Addr:              net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)),
 			Handler:           mux,
 			ReadHeaderTimeout: cfg.ReadHeaderTimeout,
+			IdleTimeout:       cfg.IdleTimeout,
 		},
 	}
 }
@@ -109,8 +126,7 @@ func writeOK(w http.ResponseWriter) {
 func (s *Server) Serve(ctx context.Context) error {
 	errCh := make(chan error, 1)
 	go func() {
-		s.log.LogAttrs(ctx, slog.LevelInfo, s.name+" server listening",
-			slog.String("addr", s.Addr()))
+		s.log.Info().Ctx(ctx).Str("addr", s.Addr()).Msg(s.name + " server listening")
 		err := s.http.ListenAndServe()
 		if errors.Is(err, http.ErrServerClosed) {
 			err = nil
@@ -126,8 +142,8 @@ func (s *Server) Serve(ctx context.Context) error {
 	case <-ctx.Done():
 	}
 
-	s.log.LogAttrs(ctx, slog.LevelInfo, s.name+" server shutting down",
-		slog.Duration("timeout", s.shutdownTimeout))
+	s.log.Info().Ctx(ctx).Dur("timeout", s.shutdownTimeout).
+		Msg(s.name + " server shutting down")
 	// A fresh context: ctx is already cancelled, and Shutdown needs a live
 	// deadline to drain within.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout)

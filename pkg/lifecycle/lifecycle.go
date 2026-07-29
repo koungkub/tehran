@@ -14,12 +14,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/signal"
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/rs/zerolog"
 )
 
 // DefaultShutdownTimeout bounds the whole ordered shutdown, as a backstop
@@ -49,9 +50,11 @@ type Component interface {
 // Config describes the supervisor. See pkg/connectrpc for why the mapstructure
 // tag is here.
 type Config struct {
-	// ShutdownTimeout bounds the entire ordered shutdown. It should exceed the
-	// sum of the components' own drain timeouts, since it exists to catch a
-	// component that ignores its context rather than to cut drains short.
+	// ShutdownTimeout bounds the entire ordered shutdown: the BeforeShutdown
+	// hooks and every component's drain, measured from the moment shutdown
+	// begins. It should exceed the sum of the components' own drain timeouts,
+	// since it exists to catch a component that ignores its context rather than
+	// to cut drains short.
 	ShutdownTimeout time.Duration `mapstructure:"shutdown_timeout"`
 }
 
@@ -64,7 +67,7 @@ func (c Config) withDefaults() Config {
 
 // Supervisor owns the run and shutdown sequence of a set of components.
 type Supervisor struct {
-	log             *slog.Logger
+	log             *zerolog.Logger
 	components      []Component
 	beforeShutdown  []func()
 	signals         []os.Signal
@@ -119,8 +122,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		t := &task{component: c, cancel: cancel, done: make(chan error, 1)}
 		running[i] = t
 
-		s.log.LogAttrs(ctx, slog.LevelInfo, "component starting",
-			slog.String("component", c.Name()))
+		s.log.Info().Ctx(ctx).Str("component", c.Name()).Msg("component starting")
 		go func() {
 			t.done <- c.Serve(componentCtx)
 			exited <- i
@@ -136,11 +138,19 @@ func (s *Supervisor) Run(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
-		s.log.LogAttrs(ctx, slog.LevelInfo, "shutdown signalled")
+		s.log.Info().Ctx(ctx).Msg("shutdown signalled")
 	case i := <-exited:
-		s.log.LogAttrs(ctx, slog.LevelWarn, "component exited early, shutting down",
-			slog.String("component", running[i].component.Name()))
+		s.log.Warn().Ctx(ctx).Str("component", running[i].component.Name()).
+			Msg("component exited early, shutting down")
 	}
+
+	// Armed before the hooks run, not inside stop: ShutdownTimeout is documented
+	// as a bound on the whole ordered shutdown, and the hooks are part of it. Left
+	// until after them, a hook that takes its time would hand stop a full fresh
+	// budget, so the sequence could overrun the orchestrator's grace period —
+	// which ends in SIGKILL, and no drain at all.
+	deadline := time.NewTimer(s.shutdownTimeout)
+	defer deadline.Stop()
 
 	// Hooks run before anything is stopped: this is where readiness is flipped
 	// off, so load balancers stop routing here while every port is still open.
@@ -148,14 +158,12 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		hook()
 	}
 
-	return s.stop(ctx, running)
+	return s.stop(ctx, running, deadline)
 }
 
-// stop drains the components in reverse registration order, one at a time.
-func (s *Supervisor) stop(ctx context.Context, running []*task) error {
-	deadline := time.NewTimer(s.shutdownTimeout)
-	defer deadline.Stop()
-
+// stop drains the components in reverse registration order, one at a time,
+// within whatever is left of deadline.
+func (s *Supervisor) stop(ctx context.Context, running []*task, deadline *time.Timer) error {
 	var errs []error
 	for i, t := range slices.Backward(running) {
 		name := t.component.Name()
@@ -166,8 +174,7 @@ func (s *Supervisor) stop(ctx context.Context, running []*task) error {
 			if err != nil {
 				errs = append(errs, fmt.Errorf("%s: %w", name, err))
 			}
-			s.log.LogAttrs(ctx, slog.LevelInfo, "component stopped",
-				slog.String("component", name))
+			s.log.Info().Ctx(ctx).Str("component", name).Msg("component stopped")
 		case <-deadline.C:
 			// Name everything still running, not just the one being waited on:
 			// they are all still holding resources.

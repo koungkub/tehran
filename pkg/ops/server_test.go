@@ -142,4 +142,22 @@ func TestConfigDefaults(t *testing.T) {
 	if got.ReadHeaderTimeout != DefaultReadHeaderTimeout {
 		t.Errorf("ReadHeaderTimeout = %v, want %v", got.ReadHeaderTimeout, DefaultReadHeaderTimeout)
 	}
+	if got.IdleTimeout != DefaultIdleTimeout {
+		t.Errorf("IdleTimeout = %v, want %v", got.IdleTimeout, DefaultIdleTimeout)
+	}
+}
+
+// TestIdleTimeoutIsSetOnTheServer pins the one timeout here that cannot be left
+// to net/http. A zero IdleTimeout falls back to ReadTimeout, and nothing sets
+// one, so an unset field means no idle timeout at all rather than a conservative
+// default — and every caller on this port is a keep-alive client.
+func TestIdleTimeoutIsSetOnTheServer(t *testing.T) {
+	srv := New(Config{})
+	if srv.http.IdleTimeout != DefaultIdleTimeout {
+		t.Errorf("IdleTimeout = %v, want %v", srv.http.IdleTimeout, DefaultIdleTimeout)
+	}
+	srv = New(Config{IdleTimeout: 7 * time.Second})
+	if srv.http.IdleTimeout != 7*time.Second {
+		t.Errorf("IdleTimeout = %v, want the configured 7s", srv.http.IdleTimeout)
+	}
 }
