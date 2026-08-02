@@ -87,9 +87,14 @@ jobs:
             exit 1
           fi
 
-      - uses: golang/govulncheck-action@v1
-        with:
-          go-version-file: go.mod
+      # Run directly rather than via govulncheck-action: the action's own
+      # go-version input defaults to "stable" and silently overrides go.mod, so
+      # the standard library it scans is whichever Go is newest rather than the
+      # one this service is built with. Half of what govulncheck reports here is
+      # stdlib, which makes that the difference between a real answer and a
+      # coincidence.
+      - name: Vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 
       # The Dockerfile is not exercised by any test, so it breaks silently and
       # is only discovered at deploy time.
