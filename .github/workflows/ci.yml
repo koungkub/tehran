@@ -1,0 +1,97 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # govulncheck is the one check whose answer changes without the code changing:
+  # a CVE published against a dependency we already ship makes a green commit red.
+  # The weekly run is what notices; nothing else here would.
+  schedule:
+    - cron: '0 3 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  # The depguard rules in .golangci.yml are architecture, not style: pkg/ must
+  # not reach into internal/, and domains must not import their siblings. Go
+  # enforces neither, so this job is the only thing holding those boundaries.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          # Matches the version developers run locally. An unpinned linter turns
+          # an upstream release into a failing build on an untouched branch.
+          version: v2.12.2
+
+  test:
+    runs-on: ubuntu-latest
+
+    # pkg/migrate has an end-to-end test that skips itself unless it is given a
+    # real database. Same image and credentials as compose.yaml so the DSN that
+    # works locally is the DSN that works here.
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: tehran
+          POSTGRES_PASSWORD: tehran
+          POSTGRES_DB: tehran
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tehran"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      TEHRAN_TEST_DATABASE_DSN: postgres://tehran:tehran@127.0.0.1:5432/tehran?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - run: go build ./...
+
+      - run: go test -race -cover ./...
+
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      # go.mod and go.sum drift quietly, and this service now depends on an
+      # external module whose version is only recorded there.
+      - name: Dependencies are tidy
+        run: |
+          go mod tidy
+          if [ -n "$(git status --porcelain go.mod go.sum)" ]; then
+            echo "::error::go.mod or go.sum is not tidy — run 'make tidy' and commit"
+            git diff -- go.mod go.sum
+            exit 1
+          fi
+
+      - uses: golang/govulncheck-action@v1
+        with:
+          go-version-file: go.mod
+
+      # The Dockerfile is not exercised by any test, so it breaks silently and
+      # is only discovered at deploy time.
+      - name: Docker image builds
+        run: docker build -t tehran:ci .
