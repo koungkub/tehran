@@ -35,19 +35,28 @@ linters:
               desc: connectrpc takes otel provider interfaces, not the telemetry package
         # Domain modules are isolated bounded contexts: they talk to each other
         # only through interfaces wired at the composition root (internal/app),
-        # never by importing a sibling directly. There is only one module today,
-        # so there is nothing to deny yet; when a second is added, give each a
-        # rule denying the others, following this shape:
-        #
-        #   greeter-no-siblings:
-        #     files:
-        #       - "**/internal/greeter/**"
-        #     deny:
-        #       - pkg: github.com/koungkub/tehran/internal/account
-        #         desc: domain modules must not import siblings
-        #
-        # depguard rejects a rule with an empty deny list, so keep this as a
-        # comment until there is a sibling to name.
+        # never by importing a sibling directly. One rule per domain, naming the
+        # others.
+        greeter-no-siblings:
+          files:
+            - "**/internal/greeter/**"
+          deny:
+            - pkg: github.com/koungkub/tehran/internal/campaign
+              desc: domain modules must not import siblings
+            - pkg: github.com/koungkub/tehran/internal/postgres
+              desc: a domain declares repository interfaces; the adapter implements them
+        campaign-no-siblings:
+          files:
+            - "**/internal/campaign/**"
+          deny:
+            - pkg: github.com/koungkub/tehran/internal/greeter
+              desc: domain modules must not import siblings
+            # The one that keeps the layering honest. internal/campaign declares
+            # the repository interfaces and internal/postgres satisfies them, so
+            # the import runs adapter -> domain and never back. Reversing it would
+            # compile, which is why it is a lint rule.
+            - pkg: github.com/koungkub/tehran/internal/postgres
+              desc: a domain declares repository interfaces; the adapter implements them
   exclusions:
     paths:
       - gen

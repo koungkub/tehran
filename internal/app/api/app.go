@@ -15,8 +15,10 @@ import (
 
 	"github.com/rs/zerolog"
 
+	"github.com/koungkub/tehran/internal/campaign"
 	"github.com/koungkub/tehran/internal/config"
 	"github.com/koungkub/tehran/internal/greeter"
+	"github.com/koungkub/tehran/internal/postgres"
 	"github.com/koungkub/tehran/internal/version"
 	"github.com/koungkub/tehran/pkg/connectrpc"
 	"github.com/koungkub/tehran/pkg/database"
@@ -36,8 +38,8 @@ var errDraining = errors.New("draining")
 type App struct {
 	log *zerolog.Logger
 	tel *telemetry.Telemetry
-	// db is nil when the database section is disabled, which is what lets this
-	// command run with no database at all.
+	// db is always open: New refuses to build the app without it, because the
+	// campaign domain cannot serve a request without one.
 	db    *database.DB
 	sup   *lifecycle.Supervisor
 	ready atomic.Bool
@@ -72,44 +74,58 @@ func New(ctx context.Context, cfg *config.Config) (_ *App, err error) {
 
 	// 1. Outbound adapters — repositories (persistence) and network clients.
 	//    Construct them here and inject into the business logic below. greeter
-	//    needs neither yet; a domain that does would wire, e.g.:
-	//        accountRepo := postgres.NewAccountRepository(app.db.Gorm())
-	//        payClient    := paygate.NewClient(cfg.Paygate)
+	//    needs neither; campaign needs both repositories, wired below. A network
+	//    client would join them here, e.g.:
+	//        payClient := paygate.NewClient(cfg.Paygate)
 	//
 	//    One pool is shared by every repository: it is the service's budget of
 	//    connections to that server, and a pool per domain would multiply it by
 	//    the number of domains.
-	if cfg.Database.Enabled {
-		db, openErr := database.Open(ctx, cfg.Database.Config,
-			database.WithLogger(log),
-			// The provider interfaces again, not the Telemetry struct.
-			database.WithTracerProvider(tel.TracerProvider),
-			database.WithMeterProvider(tel.MeterProvider),
-		)
-		if openErr != nil {
-			return nil, openErr
-		}
-		app.db = db
-		// The pool is open from here on, and only Run closes it. Anything below
-		// that fails would otherwise leave it open with nothing left holding a
-		// reference to it.
-		defer func() {
-			if err != nil {
-				err = errors.Join(err, app.db.Close())
-			}
-		}()
+	//
+	//    campaign cannot run without a database, unlike greeter, so refuse to
+	//    start rather than build a service over nil repositories that panics on
+	//    its first request. The failure belongs at startup, where a rollout that
+	//    is missing the database section fails its own health gate.
+	if !cfg.Database.Enabled {
+		return nil, errors.New("api: the campaign domain requires a database; enable the [database] section")
 	}
+	db, err := database.Open(ctx, cfg.Database.Config,
+		database.WithLogger(log),
+		// The provider interfaces again, not the Telemetry struct.
+		database.WithTracerProvider(tel.TracerProvider),
+		database.WithMeterProvider(tel.MeterProvider),
+	)
+	if err != nil {
+		return nil, err
+	}
+	app.db = db
+	// The pool is open from here on, and only Run closes it. Anything below
+	// that fails would otherwise leave it open with nothing left holding a
+	// reference to it.
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, app.db.Close())
+		}
+	}()
+
+	campaignRepo := postgres.NewCampaignRepository(db.Gorm())
+	eventRepo := postgres.NewEventRepository(db.Gorm())
 
 	// 2. Business logic — shared domain services. Inject the repos/clients
 	//    from step 1 through the constructor as each domain grows.
 	greeterSvc := greeter.NewService(log)
+	campaignSvc := campaign.NewService(log, campaignRepo, eventRepo)
 
 	// 3. Inbound transport — ConnectRPC handlers. Each is a connectrpc.Module
 	//    and registers itself, so the server never names an individual domain.
+	//    campaign exposes two: campaigns and events are two resources served by
+	//    one domain, so they share a Service and register separately.
 	greeterAPI := greeter.NewHandler(greeterSvc)
+	campaignAPI := campaign.NewHandler(campaignSvc)
+	eventAPI := campaign.NewEventHandler(campaignSvc)
 
 	rpcServer, err := connectrpc.New(cfg.Server,
-		connectrpc.WithModules(greeterAPI),
+		connectrpc.WithModules(greeterAPI, campaignAPI, eventAPI),
 		connectrpc.WithLogger(log),
 		// The provider interfaces, not the Telemetry struct: that is what keeps
 		// pkg/connectrpc independent of pkg/telemetry.
@@ -130,11 +146,9 @@ func New(ctx context.Context, cfg *config.Config) (_ *App, err error) {
 			return nil
 		}),
 	}
-	if app.db != nil {
-		// Readiness, not liveness: an instance that cannot reach the database
-		// cannot serve, but restarting it will not bring the database back.
-		opsOpts = append(opsOpts, ops.WithReadyCheck(app.db.Name(), app.db.Ping))
-	}
+	// Readiness, not liveness: an instance that cannot reach the database cannot
+	// serve, but restarting it will not bring the database back.
+	opsOpts = append(opsOpts, ops.WithReadyCheck(app.db.Name(), app.db.Ping))
 	opsServer := ops.New(cfg.Ops, opsOpts...)
 
 	// 4. Lifecycle. Registration order is start order and shutdown runs in
@@ -171,10 +185,7 @@ func (a *App) Run(ctx context.Context) error {
 	// components: registered as a component it would be shut down partway through
 	// the sequence, pulling the pool out from under handlers that are still
 	// draining. Here every user of it has already stopped.
-	errs := []error{err}
-	if a.db != nil {
-		errs = append(errs, a.db.Close())
-	}
+	errs := []error{err, a.db.Close()}
 
 	// Nothing is still producing spans or metrics to flush at this point either.
 	flushCtx, cancel := context.WithTimeout(context.Background(), telemetryFlushTimeout)

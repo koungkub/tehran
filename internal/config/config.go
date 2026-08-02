@@ -47,8 +47,8 @@ type Config struct {
 type Database struct {
 	// Enabled is read here and not by pkg/database, because whether a service
 	// needs a database at all is not a property of the database. The api command
-	// serves greeter, which has no repository, so it starts without one; the
-	// first domain that persists anything turns this on.
+	// now requires one — the campaign domain persists — and refuses to start with
+	// this off; a future command serving only greeter would run with it off.
 	Enabled bool `mapstructure:"enabled"`
 	// Squashed so the library's keys sit directly under [database] rather than
 	// under a nested table of their own.

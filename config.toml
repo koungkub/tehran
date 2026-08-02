@@ -54,9 +54,12 @@ read_header_timeout = "10s"
 idle_timeout = "120s"
 
 [database]
-# Off until a domain here persists something: greeter has no repository, so the
-# api command needs no database to start. The first repository turns this on.
-enabled = false
+# On, and no longer optional for the api command: the campaign domain persists
+# campaigns and events, so internal/app/api refuses to start without a pool rather
+# than build a service over nil repositories that fails on its first request.
+# jsonb and the row-value keyset predicates the repositories use are PostgreSQL's;
+# the mysql driver would need both revisited.
+enabled = true
 driver = "postgres" # or "mysql"; anything else is passed in as a dialector
 host = "127.0.0.1"
 port = 5432
