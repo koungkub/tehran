@@ -6,8 +6,8 @@ import (
 
 	"connectrpc.com/connect"
 
-	greeterv1 "github.com/koungkub/tehran/gen/proto/greeter/v1"
-	"github.com/koungkub/tehran/gen/proto/greeter/v1/greeterv1connect"
+	greeterv1 "github.com/koungkub/isfahan/gen/go/proto/greeter/v1"
+	"github.com/koungkub/isfahan/gen/go/proto/greeter/v1/greeterv1connect"
 )
 
 // Handler adapts the greeter Service to the generated ConnectRPC interface.

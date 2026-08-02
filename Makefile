@@ -10,10 +10,7 @@ LDFLAGS := -s -w \
 
 GOOSE   := github.com/pressly/goose/v3/cmd/goose@v3.27.3
 
-.PHONY: generate build test lint docker-build run migrate-new tidy
-
-generate: ## Regenerate protobuf/Connect code
-	buf generate
+.PHONY: build test lint docker-build run migrate-new tidy
 
 build: ## Build static binary into bin/
 	CGO_ENABLED=0 go build -trimpath -ldflags '$(LDFLAGS)' -o bin/$(BINARY) ./cmd/$(BINARY)
@@ -21,8 +18,7 @@ build: ## Build static binary into bin/
 test: ## Run all tests with race detector
 	go test -race -cover ./...
 
-lint: ## buf lint + go vet + golangci-lint (if installed)
-	buf lint
+lint: ## go vet + golangci-lint (if installed)
 	go vet ./...
 	@if command -v golangci-lint >/dev/null 2>&1; then golangci-lint run; else echo "golangci-lint not installed, skipping"; fi
 

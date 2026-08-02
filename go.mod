@@ -11,6 +11,7 @@ require (
 	github.com/go-sql-driver/mysql v1.10.0
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
+	github.com/koungkub/isfahan v0.1.0
 	github.com/pressly/goose/v3 v3.27.3
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rs/zerolog v1.35.1

@@ -13,8 +13,8 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	campaignv1 "github.com/koungkub/tehran/gen/proto/campaign/v1"
-	"github.com/koungkub/tehran/gen/proto/campaign/v1/campaignv1connect"
+	campaignv1 "github.com/koungkub/isfahan/gen/go/proto/campaign/v1"
+	"github.com/koungkub/isfahan/gen/go/proto/campaign/v1/campaignv1connect"
 )
 
 // TestToConnectError is the table the whole error contract rests on: every domain
