@@ -3,6 +3,25 @@
 # compose.yaml is the local development database only, and Coolify would
 # otherwise find that one first and deploy a bare Postgres.
 #
+# Postgres is NOT defined here. It is its own Coolify resource, which means two
+# things have to be true for this app to reach it:
+#
+#   1. "Connect to Predefined Network" must be on for this resource, or the
+#      database's container name will not resolve from here — the two stacks
+#      are on separate compose networks until it is.
+#   2. The TEHRAN_DATABASE_* values below come from Coolify's Environment
+#      Variables tab, not from this file. The password especially: it does not
+#      belong in git, and the hostname is Coolify's to assign, not ours to
+#      guess. Copy them from the Postgres resource page.
+#
+# Set, in Coolify → Environment Variables:
+#
+#   TEHRAN_DATABASE_HOST      the Postgres resource's internal hostname
+#   TEHRAN_DATABASE_PORT      5432 unless it was changed
+#   TEHRAN_DATABASE_USER      its username
+#   TEHRAN_DATABASE_PASSWORD  its password
+#   TEHRAN_DATABASE_DATABASE  the database name
+#
 # Migrations are not run here. `tehran db migrate` is a separate, deliberate
 # step, so that a migration that fails does not turn into a crash-looping
 # service that keeps retrying it:
@@ -15,7 +34,7 @@
 services:
   tehran:
     # Pinned, not :latest. Releasing is already an explicit act (the tag
-    # workflow); upgrading here should be the same, and a pinned digest in git
+    # workflow); upgrading here should be the same, and a pinned version in git
     # is the record of what is actually deployed.
     image: ghcr.io/koungkub/tehran:0.1.0
     restart: unless-stopped
@@ -23,9 +42,11 @@ services:
     # No healthcheck stanza: the runtime image is distroless and ships nothing
     # but the binary — no shell, no curl, no wget for a CMD to invoke. Use
     # Coolify's own HTTP health check instead, pointed at /readyz on port 9090.
-    depends_on:
-      postgres:
-        condition: service_healthy
+    #
+    # No depends_on either: the database is a separate Coolify resource with its
+    # own lifecycle, so this container can start before it is reachable. That is
+    # what restart: unless-stopped covers — the api command exits on a failed
+    # connection and is restarted until Postgres answers.
 
     environment:
       # Coolify generates a domain for this service and points its proxy at
@@ -39,14 +60,18 @@ services:
       # panic on its first request.
       - TEHRAN_DATABASE_ENABLED=true
       - TEHRAN_DATABASE_DRIVER=postgres
-      - TEHRAN_DATABASE_HOST=postgres
-      - TEHRAN_DATABASE_PORT=5432
-      - TEHRAN_DATABASE_USER=tehran
-      - TEHRAN_DATABASE_PASSWORD=${SERVICE_PASSWORD_POSTGRES}
-      - TEHRAN_DATABASE_DATABASE=tehran
-      # Plaintext is correct here and only here: this connection never leaves
-      # the compose network. Change it if Postgres ever moves off this host.
-      - TEHRAN_DATABASE_SSL_MODE=disable
+
+      # Supplied by Coolify, per the header. Left unset, the defaults compiled
+      # into the binary point at 127.0.0.1 with an empty user, which fails at
+      # startup rather than connecting to something unexpected.
+      - TEHRAN_DATABASE_HOST=${TEHRAN_DATABASE_HOST}
+      - TEHRAN_DATABASE_PORT=${TEHRAN_DATABASE_PORT:-5432}
+      - TEHRAN_DATABASE_USER=${TEHRAN_DATABASE_USER}
+      - TEHRAN_DATABASE_PASSWORD=${TEHRAN_DATABASE_PASSWORD}
+      - TEHRAN_DATABASE_DATABASE=${TEHRAN_DATABASE_DATABASE}
+      # Overridable, because "the database is on this host" is an assumption
+      # that stops holding the moment it moves to a managed one.
+      - TEHRAN_DATABASE_SSL_MODE=${TEHRAN_DATABASE_SSL_MODE:-disable}
 
       # Defaults to on, aimed at localhost:4317, which is nothing inside a
       # container. Turn it back on with the collector's address when there is
@@ -55,42 +80,3 @@ services:
 
       - TEHRAN_LOG_LEVEL=info
       - TEHRAN_LOG_FORMAT=json
-
-  postgres:
-    image: postgres:18
-    restart: unless-stopped
-
-    # No ports: stanza. The database is reachable by service name from the
-    # compose network, and publishing it would put it on the server's
-    # interfaces for no gain.
-    environment:
-      - POSTGRES_USER=tehran
-      - POSTGRES_PASSWORD=${SERVICE_PASSWORD_POSTGRES}
-      - POSTGRES_DB=tehran
-      # Checksums turn silent page corruption into an error. initdb only reads
-      # this on the very first start, so it cannot be added later.
-      - POSTGRES_INITDB_ARGS=--data-checksums
-
-    volumes:
-      # Postgres 18 moved PGDATA to /var/lib/postgresql/18/docker and declares
-      # VOLUME /var/lib/postgresql. Mounting the older /var/lib/postgresql/data
-      # would leave the real data directory in the container's writable layer,
-      # to be lost on the next recreate — which on a deploy platform means
-      # every redeploy.
-      - pgdata:/var/lib/postgresql
-
-    # Parallel query and large sorts use shared memory; the 64MB default
-    # produces "could not resize shared memory segment" under load.
-    shm_size: 256mb
-
-    healthcheck:
-      # -U/-d matter: bare pg_isready reports ready while initdb is still
-      # running its bootstrap pass, and the app would connect to nothing.
-      test: ["CMD-SHELL", "pg_isready -U tehran -d tehran"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-      start_period: 10s
-
-volumes:
-  pgdata:
