@@ -1,0 +1,66 @@
+name: tag
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, e.g. v1.4.0'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Pin to main regardless of which branch the dispatch was launched
+          # from, so a release can never be cut from a feature branch by
+          # picking the wrong entry in the Actions dropdown.
+          ref: main
+          # Tags are what the guards below check against, and a shallow clone
+          # fetches none of them.
+          fetch-depth: 0
+
+      # A tag is permanent, and its name becomes a permanent image name. A typo
+      # here is not a re-run — it is a bad tag plus a bad image that outlive it.
+      - name: Create tag
+        id: tag
+        # Passed via env, never interpolated into the script body: the input is
+        # arbitrary text, and ${{ }} splices it in before bash parses the line.
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::'$VERSION' is not vMAJOR.MINOR.PATCH (optional -prerelease)"
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
+            echo "::error::tag $VERSION already exists — released versions are never moved"
+            exit 1
+          fi
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag -a "$VERSION" -m "$VERSION"
+          git push origin "$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  # A tag pushed with GITHUB_TOKEN does not trigger `on: push: tags` — that is a
+  # deliberate loop guard in Actions, not a bug. Calling the workflow directly is
+  # what makes one button produce both the tag and the image.
+  image:
+    needs: tag
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/release.yml
+    with:
+      version: ${{ needs.tag.outputs.version }}
