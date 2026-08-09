@@ -22,16 +22,48 @@
 #   TEHRAN_DATABASE_PASSWORD  its password
 #   TEHRAN_DATABASE_DATABASE  the database name
 #
-# Migrations are not run here. `tehran db migrate` is a separate, deliberate
-# step, so that a migration that fails does not turn into a crash-looping
-# service that keeps retrying it:
+# Migrations run as their own service, below, and the api waits for them to
+# succeed. Coolify's pre/post-deployment command fields cannot do this job:
+# they run `docker exec <container> sh -c '<command>'`, and the runtime image
+# is distroless, so the wrapper fails with `exec: "sh": executable file not
+# found in $PATH` before the command is even read.
 #
-#   docker exec <tehran-container> /tehran db migrate
-#
-# That works despite the distroless image having no shell — docker exec runs
-# the binary directly and inherits the container's environment.
+# The environment is written out once per service rather than shared through a
+# YAML anchor. The duplication is deliberate: Coolify parses and rewrites this
+# file, and an anchor is a dependency on its YAML merge-key handling for no
+# gain beyond brevity. Keep the two blocks, and the two image tags, in step.
 
 services:
+  # Runs to completion and exits; it is not a server. Every deploy applies
+  # whatever is pending, and goose skips what is already applied, so a deploy
+  # with no new migrations costs one connection and a few milliseconds.
+  migrate:
+    # Must match the tehran service's tag exactly. A schema migrated by one
+    # version and served by another is the failure this whole ordering exists
+    # to prevent.
+    image: ghcr.io/koungkub/tehran:0.1.0
+
+    # Overrides the image's default CMD of ["api"]. ENTRYPOINT is already
+    # /tehran, so this is `/tehran db migrate` — no shell involved.
+    command: ["db", "migrate"]
+
+    # Without this the container is restarted after it exits successfully, and
+    # a service that is supposed to finish never registers as finished.
+    restart: "no"
+
+    environment:
+      - TEHRAN_DATABASE_ENABLED=true
+      - TEHRAN_DATABASE_DRIVER=postgres
+      - TEHRAN_DATABASE_HOST=${TEHRAN_DATABASE_HOST}
+      - TEHRAN_DATABASE_PORT=${TEHRAN_DATABASE_PORT:-5432}
+      - TEHRAN_DATABASE_USER=${TEHRAN_DATABASE_USER}
+      - TEHRAN_DATABASE_PASSWORD=${TEHRAN_DATABASE_PASSWORD}
+      - TEHRAN_DATABASE_DATABASE=${TEHRAN_DATABASE_DATABASE}
+      - TEHRAN_DATABASE_SSL_MODE=${TEHRAN_DATABASE_SSL_MODE:-disable}
+      - TEHRAN_OTEL_ENABLED=false
+      - TEHRAN_LOG_LEVEL=info
+      - TEHRAN_LOG_FORMAT=json
+
   tehran:
     # Pinned, not :latest. Releasing is already an explicit act (the tag
     # workflow); upgrading here should be the same, and a pinned version in git
@@ -39,14 +71,23 @@ services:
     image: ghcr.io/koungkub/tehran:0.1.0
     restart: unless-stopped
 
+    # service_completed_successfully, not service_started: a migration that
+    # fails must stop the rollout rather than hand traffic to a service whose
+    # schema is half-applied. Readiness would not catch it either — /readyz
+    # answers 200 against an unmigrated database, because it checks the
+    # connection and not the schema.
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
     # No healthcheck stanza: the runtime image is distroless and ships nothing
     # but the binary — no shell, no curl, no wget for a CMD to invoke. Use
     # Coolify's own HTTP health check instead, pointed at /readyz on port 9090.
     #
-    # No depends_on either: the database is a separate Coolify resource with its
-    # own lifecycle, so this container can start before it is reachable. That is
-    # what restart: unless-stopped covers — the api command exits on a failed
-    # connection and is restarted until Postgres answers.
+    # The database is a separate Coolify resource with its own lifecycle, so it
+    # cannot be waited on from here. That is what restart: unless-stopped
+    # covers — the api command exits on a failed connection and is restarted
+    # until Postgres answers.
 
     environment:
       # Coolify generates a domain for this service and points its proxy at
