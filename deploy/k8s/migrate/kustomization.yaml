@@ -1,0 +1,26 @@
+# The migration, applied on its own so that it can be waited on before the app
+# rolls. Applying everything in one pass would create the Job and the
+# Deployment together, and the new pods would race the migration they depend
+# on — a race readiness cannot arbitrate, because /readyz checks the
+# connection and not the schema.
+#
+# The namespace and ConfigMap are here as well because the Job needs both to
+# exist first. Applying them twice is harmless; the app kustomization does the
+# same.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: tehran
+
+resources:
+  - ../base
+  - job-migrate.yaml
+
+components:
+  - ../release
+
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/name: tehran
+      app.kubernetes.io/part-of: tehran

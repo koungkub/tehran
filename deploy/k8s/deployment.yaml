@@ -1,0 +1,97 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tehran
+  labels:
+    app.kubernetes.io/name: tehran
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tehran
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: tehran
+    spec:
+      securityContext:
+        # Numeric, not the image's own `nonroot` name. runAsNonRoot cannot
+        # verify a username — the kubelet refuses the pod with "container has
+        # runAsNonRoot and image has non-numeric user (nonroot), cannot verify
+        # user is non-root" — so the UID from the distroless base is repeated
+        # here. 65532 is nonroot in gcr.io/distroless/static-debian12.
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: tehran
+          image: ghcr.io/koungkub/tehran:0.1.0
+
+          # The image already defaults to ["api"]; stated so that reading this
+          # file tells you which command runs without pulling the image.
+          args: ["api"]
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          ports:
+            - name: rpc
+              containerPort: 8080
+            - name: ops
+              containerPort: 9090
+
+          envFrom:
+            - configMapRef:
+                name: tehran-config
+            # Created out of band — see secret.example.yaml. The pod stays in
+            # CreateContainerConfigError until it exists, which is the correct
+            # failure: no credentials, no start.
+            - secretRef:
+                name: tehran-database
+
+          # Both probes are on the ops port, which is a second HTTP server
+          # with its own listener. Probing the RPC port instead would report
+          # healthy on a process whose ops server had died, and vice versa.
+          #
+          # Note what readiness does NOT cover: /readyz checks the database
+          # connection, not the schema, so it answers 200 against an
+          # unmigrated database. That is why migrations are their own Job and
+          # not something the rollout is trusted to notice.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: ops
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: ops
+            # Longer than readiness on purpose: readiness pulling a pod out of
+            # the Service is cheap and reversible, and killing the process is
+            # neither. A database blip should do the first, not the second.
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              # No CPU limit: throttling a Go service that is briefly busy adds
+              # latency without protecting anything the request already
+              # reserves. Memory is limited because exceeding it is a leak,
+              # and a leak should be killed rather than starve the node.
+              memory: 256Mi

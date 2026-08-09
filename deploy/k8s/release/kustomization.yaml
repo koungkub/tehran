@@ -1,0 +1,15 @@
+# The one place a release is named.
+#
+# A Component rather than a plain field, because the version has to reach two
+# kustomizations that are applied separately — the migration overlay and the
+# app — and a tag written twice is a tag that eventually disagrees with
+# itself. The version that migrates the schema is by construction the version
+# that serves it.
+#
+# Bumping a release is this file and nothing else.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+images:
+  - name: ghcr.io/koungkub/tehran
+    newTag: 0.1.0

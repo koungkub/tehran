@@ -1,0 +1,36 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tehran
+  labels:
+    app.kubernetes.io/name: tehran
+  # Connect's own protocol and its JSON form are ordinary HTTP/1.1 POSTs, so
+  # this Ingress serves them as shipped. gRPC clients are the exception: they
+  # need h2c to the backend, which on Traefik means adding
+  #
+  #   annotations:
+  #     traefik.ingress.kubernetes.io/service.serversscheme: h2c
+spec:
+  # k3s ships Traefik as its default ingress controller. If Traefik was
+  # disabled at install time (--disable=traefik), change this to whatever
+  # replaced it.
+  ingressClassName: traefik
+
+  rules:
+    # nip.io resolves any *.<ip>.nip.io name to that IP with no DNS to set up,
+    # which makes this work on a LAN cluster as written. Replace the host with
+    # a real name when there is one.
+    - host: tehran.192.168.227.131.nip.io
+      http:
+        paths:
+          # Connect routes are /<package>.<Service>/<Method>, so the whole
+          # prefix belongs to the RPC port. 9090 is not routed here at all —
+          # /metrics and the probes have no business being reachable from
+          # outside the cluster.
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: tehran
+                port:
+                  name: rpc

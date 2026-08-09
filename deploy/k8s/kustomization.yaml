@@ -1,0 +1,30 @@
+# The application. Deliberately does not include job-migrate.yaml — the
+# migration is applied first, on its own, by deploy/k8s/migrate, so that it can
+# be waited on before these pods roll. See the README.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: tehran
+
+resources:
+  - base
+  - deployment.yaml
+  - service.yaml
+  - ingress.yaml
+
+# secret.example.yaml is deliberately absent: it holds placeholders, and the
+# real Secret is created out of band so credentials never reach this
+# repository. See the README.
+
+components:
+  - release
+
+# labels, not commonLabels: the latter is deprecated, and it writes into
+# spec.selector.matchLabels, which a Deployment will not accept a change to
+# afterwards. Editing this list would then mean deleting the Deployment.
+# includeSelectors: false keeps selectors as the files declare them.
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/name: tehran
+      app.kubernetes.io/part-of: tehran

@@ -1,0 +1,74 @@
+# Applies pending migrations, then exits. Deliberately not an initContainer:
+# an initContainer runs once per pod, and this runs once per deploy.
+#
+# A Job's pod template is immutable, so re-applying this after an image bump
+# fails with "field is immutable". `make k8s-deploy` deletes the Job first,
+# which is why deploying by hand means running that same delete.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: tehran-migrate
+  labels:
+    app.kubernetes.io/name: tehran
+    app.kubernetes.io/component: migrate
+spec:
+  # Cleans up after itself so a later `kubectl get jobs` shows what is running
+  # rather than a history. Long enough to still read the logs of a deploy that
+  # just went wrong.
+  ttlSecondsAfterFinished: 600
+
+  # Retries cover a database that is briefly unreachable. They do not rescue a
+  # migration with a syntax error — that fails identically four times and then
+  # marks the Job failed, which is what should happen.
+  backoffLimit: 3
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: tehran
+        app.kubernetes.io/component: migrate
+    spec:
+      # Never, not OnFailure: a failed attempt should produce a new pod whose
+      # logs stand on their own, rather than restart in place and overwrite the
+      # output that explains the failure.
+      restartPolicy: Never
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: migrate
+          # Must match the Deployment's tag. A schema migrated by one version
+          # and served by another is the failure the ordering exists to
+          # prevent, so both are bumped by kustomize's images: field rather
+          # than by hand.
+          image: ghcr.io/koungkub/tehran:0.1.0
+
+          # ENTRYPOINT is already /tehran, so this is `/tehran db migrate`. No
+          # shell is involved, which matters: the runtime image is distroless
+          # and has no /bin/sh for a command wrapper to use.
+          args: ["db", "migrate"]
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          envFrom:
+            - configMapRef:
+                name: tehran-config
+            - secretRef:
+                name: tehran-database
+
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi

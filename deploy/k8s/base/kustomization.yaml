@@ -1,0 +1,12 @@
+# The two objects both the app and the migration need to exist before
+# anything else: the namespace they live in, and the config they both read.
+#
+# A directory rather than two loose files, because Kustomize refuses to
+# reference a file above its own root — deploy/k8s/migrate cannot reach
+# ../namespace.yaml, but it can include this directory.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - configmap.yaml

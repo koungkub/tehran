@@ -1,0 +1,30 @@
+# The non-secret half of the configuration. Everything here is also a
+# hardcoded default in internal/config, so this file is the set of defaults
+# that are wrong for a cluster rather than a full listing.
+#
+# A plain ConfigMap, not a kustomize configMapGenerator: a generated name
+# carries a content hash, and the migration Job has to be appliable on its own
+# without kustomize rewriting the reference for it. The cost is that editing
+# this file does not restart anything by itself — follow it with
+# `kubectl rollout restart deployment/tehran -n tehran`.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tehran-config
+data:
+  # Without this the api command exits 1 on boot: the campaign domain
+  # persists, and it refuses to start over a nil repository rather than panic
+  # on its first request.
+  TEHRAN_DATABASE_ENABLED: "true"
+  TEHRAN_DATABASE_DRIVER: postgres
+
+  # In-cluster traffic to a database on the same node. Set to require (or
+  # verify-full) the moment Postgres moves off-cluster.
+  TEHRAN_DATABASE_SSL_MODE: disable
+
+  # Defaults to on, aimed at localhost:4317, which is nothing inside a pod.
+  # Turn it back on with the collector's Service address when there is one.
+  TEHRAN_OTEL_ENABLED: "false"
+
+  TEHRAN_LOG_LEVEL: info
+  TEHRAN_LOG_FORMAT: json

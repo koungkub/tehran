@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: tehran
+  labels:
+    app.kubernetes.io/name: tehran
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: tehran
+  ports:
+    - name: rpc
+      port: 8080
+      targetPort: rpc
+    # Carries /metrics and the probes. On the Service so a ServiceMonitor or a
+    # `kubectl port-forward svc/tehran 9090` can reach it; the Ingress
+    # deliberately does not route to it.
+    - name: ops
+      port: 9090
+      targetPort: ops
